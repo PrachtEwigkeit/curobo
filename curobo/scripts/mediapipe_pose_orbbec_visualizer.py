@@ -43,6 +43,12 @@ import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+
+# Orbbec Python SDK 的核心对象：
+# - Pipeline/Config 负责打开设备、配置流、启动/停止相机；
+# - OBSensorType 用来选择 COLOR / DEPTH 传感器；
+# - OBFormat 用来判断彩色帧编码格式，并转换为 OpenCV 可用的 BGR 图像；
+# - OBAlignMode 用来配置深度帧与彩色帧的对齐方式。
 from pyorbbecsdk import (
     Config,
     OBAlignMode,
@@ -59,6 +65,9 @@ from pyorbbecsdk import (
 # MediaPipe Pose Landmark index
 # ============================================================
 
+# MediaPipe PoseLandmarker 固定输出 33 个人体关键点。
+# 这里显式维护名字列表，后面可以通过 IDX["RIGHT_WRIST"] 这类写法
+# 读出对应 landmark 下标，避免在计算角度、连线、可视化时直接写魔法数字。
 LANDMARK_NAMES = [
     "NOSE",
     "LEFT_EYE_INNER",
@@ -97,6 +106,8 @@ LANDMARK_NAMES = [
 
 IDX = {name: i for i, name in enumerate(LANDMARK_NAMES)}
 
+# 自定义骨架连线拓扑。MediaPipe 本身也提供连接关系，但这里手写一份，
+# 方便同时复用于主画面、normalized skeleton、world front/side 三种视图。
 POSE_CONNECTIONS = [
     # face
     (0, 1), (1, 2), (2, 3), (3, 7),
@@ -140,6 +151,21 @@ POSE_CONNECTIONS = [
     (30, 32),
 ]
 
+RIGHT_ARM_RGBD_NAMES = [
+    "RIGHT_SHOULDER",
+    "RIGHT_ELBOW",
+    "RIGHT_WRIST",
+    "RIGHT_INDEX",
+    "RIGHT_THUMB",
+    "RIGHT_PINKY",
+]
+
+RGBD_LANDMARK_NAMES = RIGHT_ARM_RGBD_NAMES + [
+    "LEFT_SHOULDER",
+    "LEFT_ELBOW",
+    "LEFT_WRIST",
+]
+
 
 MODEL_URLS = {
     "lite": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
@@ -147,6 +173,8 @@ MODEL_URLS = {
     "heavy": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
 }
 
+# 本地缓存的 MediaPipe Tasks 模型文件名。
+# ensure_model() 会优先复用本地文件，不存在时才下载。
 MODEL_FILES = {
     "lite": "pose_landmarker_lite.task",
     "full": "pose_landmarker_full.task",
@@ -163,21 +191,29 @@ def parse_args():
         description="MediaPipe Tasks API PoseLandmarker webcam visualizer"
     )
 
+    # --camera 保留只是为了兼容旧 webcam 版本命令行；
+    # Orbbec SDK 当前通过 Pipeline() 自动打开默认 Orbbec 设备。
     parser.add_argument(
         "--camera",
         type=int,
         default=0,
         help="kept for CLI compatibility; Orbbec SDK opens the default Orbbec device",
     )
-    parser.add_argument("--width", type=int, default=960)
-    parser.add_argument("--height", type=int, default=960)
-    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=800)
+    parser.add_argument("--fps", type=int, default=10)
+
+    # Orbbec 深度流默认打开：
+    # - 彩色帧用于 MediaPipe 姿态检测；
+    # - 深度帧会被同步读取并缓存，后续可以用于 2D landmark + depth 反投影。
     parser.add_argument(
         "--no-depth",
         action="store_true",
         default=False,
         help="disable Orbbec depth stream and use color only",
     )
+    # 对齐模式控制 depth 和 color 是否在同一视角/分辨率坐标系下输出。
+    # HW 通常性能最好；SW 作为兼容后备；NONE 则完全不做对齐。
     parser.add_argument(
         "--orbbec-align",
         type=str,
@@ -185,6 +221,8 @@ def parse_args():
         choices=["HW", "SW", "NONE"],
         help="depth-to-color align mode when depth is enabled",
     )
+    # 帧同步用于让 color/depth 时间上尽量对应。
+    # 如果某些设备或驱动不支持，可以用 --disable-frame-sync 关闭。
     parser.add_argument(
         "--disable-frame-sync",
         action="store_true",
@@ -199,6 +237,8 @@ def parse_args():
         choices=["lite", "full", "heavy"],
         help="pose landmarker model type",
     )
+    # 兼容旧 MediaPipe Solutions 风格的 --model-complexity 参数：
+    # 0/1/2 会在 main() 里映射到 lite/full/heavy 三种 Tasks 模型。
     parser.add_argument(
         "--model-complexity",
         type=int,
@@ -225,13 +265,20 @@ def parse_args():
     parser.add_argument("--min-tracking-confidence", type=float, default=0.5)
     parser.add_argument("--visibility-threshold", type=float, default=0.45)
 
+    # 旧版参数保留但隐藏在 help 中，避免历史命令直接报错。
+    # 实际开关采用下面的 --no-draw-names / --no-segmentation 语义。
     parser.add_argument("--draw-names", action="store_true", default=False, help=argparse.SUPPRESS)
     parser.add_argument("--segmentation", action="store_true", default=False, help=argparse.SUPPRESS)
+    # 默认显示关键点名称、默认开启 segmentation；
+    # 如需关闭，使用对应的 no-* 参数。
     parser.add_argument("--no-draw-names", action="store_true", default=False)
     parser.add_argument("--no-segmentation", action="store_true", default=False)
+    # 默认镜像显示更接近普通自拍预览；加 --no-mirror 才关闭镜像。
     parser.add_argument("--no-mirror", action="store_true", default=False)
     parser.add_argument("--csv", type=str, default="")
     parser.add_argument("--show-index", action="store_true")
+    # 右侧信息栏参数：panel-width 控制横向宽度；
+    # panel-scroll-height 控制右侧虚拟画布高度，内容多时用滚轮/w/s 滚动查看。
     parser.add_argument(
         "--panel-width",
         type=int,
@@ -241,9 +288,10 @@ def parse_args():
     parser.add_argument(
         "--display-scale",
         type=float,
-        default=1.0,
+        default=0.8,
         help="scale the final composed window, e.g. 0.9 for small screens",
     )
+    
     parser.add_argument(
         "--panel-scroll-height",
         type=int,
@@ -259,17 +307,21 @@ def parse_args():
 # ============================================================
 
 def ensure_model(model_name: str, model_path: str, models_dir: str) -> str:
+    # 用户显式给了模型路径时，完全信任该路径，不做自动下载。
     if model_path:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"指定的模型文件不存在: {model_path}")
         return model_path
 
+    # 没有指定模型路径时，把模型缓存到 models_dir。
+    # 这样第一次运行下载，后续运行直接复用本地 .task 文件。
     os.makedirs(models_dir, exist_ok=True)
 
     local_path = os.path.join(models_dir, MODEL_FILES[model_name])
     if os.path.exists(local_path):
         return local_path
 
+    # MediaPipe Tasks 模型是 .task 文件，不是旧版 solutions 的 pbtxt/tflite 组合。
     url = MODEL_URLS[model_name]
     print(f"[INFO] 模型不存在，开始下载: {url}")
     print(f"[INFO] 保存到: {local_path}")
@@ -293,6 +345,9 @@ def ensure_model(model_name: str, model_path: str, models_dir: str) -> str:
 # Orbbec camera utilities
 # ============================================================
 
+# 以下几个函数只负责“像素格式转换”：
+# Orbbec 彩色流可能以 RGB、MJPG、YUYV、UYVY、I420、NV12、NV21 等格式输出。
+# MediaPipe 和本脚本后续可视化统一使用 OpenCV BGR，所以这里先全部归一化。
 def yuyv_to_bgr(frame: np.ndarray, width: int, height: int) -> np.ndarray:
     return cv2.cvtColor(frame.reshape((height, width, 2)), cv2.COLOR_YUV2BGR_YUY2)
 
@@ -314,18 +369,25 @@ def nv21_to_bgr(frame: np.ndarray, width: int, height: int) -> np.ndarray:
 
 
 def orbbec_frame_to_bgr_image(frame: VideoFrame) -> Optional[np.ndarray]:
+    # Orbbec VideoFrame 给出原始字节、宽高和像素格式；
+    # 这里不做姿态检测，只把相机帧转换成 frame_bgr。
     width = frame.get_width()
     height = frame.get_height()
     color_format = frame.get_format()
     data = np.asanyarray(frame.get_data())
 
+    # RGB 是 Orbbec examples 中最常见的彩色格式；
+    # OpenCV 绘图/显示默认 BGR，所以需要 RGB -> BGR。
     if color_format == OBFormat.RGB:
         image = np.resize(data, (height, width, 3))
         return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    # 如果设备已经输出 BGR，则只需要整理成 HxWx3。
     if color_format == OBFormat.BGR:
         return np.resize(data, (height, width, 3))
+    # MJPG 是压缩帧，需要先用 OpenCV 解码。
     if color_format == OBFormat.MJPG:
         return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    # 其余 YUV 格式按对应 OpenCV code 转 BGR。
     if color_format == OBFormat.YUYV:
         return yuyv_to_bgr(data, width, height)
     if color_format == OBFormat.UYVY:
@@ -342,6 +404,8 @@ def orbbec_frame_to_bgr_image(frame: VideoFrame) -> Optional[np.ndarray]:
 
 
 def orbbec_depth_frame_to_mm(depth_frame) -> np.ndarray:
+    # Orbbec 深度帧通常是 uint16 原始深度值；
+    # get_depth_scale() 给出该设备/模式下的尺度因子，乘完后得到实际深度单位。
     width = depth_frame.get_width()
     height = depth_frame.get_height()
     scale = depth_frame.get_depth_scale()
@@ -351,6 +415,9 @@ def orbbec_depth_frame_to_mm(depth_frame) -> np.ndarray:
 
 
 class OrbbecCamera:
+    # 这个类是本文件与 webcam 版本唯一真正不同的核心：
+    # 它把 Orbbec Pipeline/Config/read/stop 包装成类似 cv2.VideoCapture 的接口。
+    # main() 后面仍然只关心 ok, frame_bgr, depth_mm，不关心底层 SDK 细节。
     def __init__(
         self,
         width: int,
@@ -366,10 +433,14 @@ class OrbbecCamera:
         self.enable_depth = enable_depth
         self.align_mode = align_mode
         self.enable_sync = enable_sync
+        # Pipeline 是 Orbbec SDK 的运行入口；Config 保存将要启用的 stream/profile。
         self.pipeline = Pipeline()
         self.config = Config()
+        self.color_intrinsics = None
 
     def _select_color_profile(self) -> VideoStreamProfile:
+        # 优先请求用户命令行指定的 width/height/fps + RGB 格式。
+        # 如果设备不支持该 profile，就回退到 SDK 默认 color profile。
         profile_list = self.pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
         try:
             return profile_list.get_video_stream_profile(
@@ -382,6 +453,8 @@ class OrbbecCamera:
             return color_profile
 
     def _select_depth_profile(self) -> Optional[VideoStreamProfile]:
+        # 深度流用于获取 depth map。这里采用默认 depth profile，
+        # 因为不同 Orbbec 型号支持的深度分辨率/格式差异比较大。
         try:
             profile_list = self.pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
             depth_profile = profile_list.get_default_video_stream_profile()
@@ -393,10 +466,14 @@ class OrbbecCamera:
             return None
 
     def start(self):
+        # 先启用 color stream：这是 MediaPipe 姿态检测的输入来源。
         color_profile = self._select_color_profile()
         print("[INFO] Using Orbbec color profile:", color_profile)
         self.config.enable_stream(color_profile)
+        self.color_intrinsics = self._extract_color_intrinsics(color_profile)
 
+        # depth stream 可选启用。启用后会配置 align 和 frame sync，
+        # 但 MediaPipe 本身仍然只使用 color image。
         depth_profile = self._select_depth_profile() if self.enable_depth else None
         if depth_profile is not None:
             self.config.enable_stream(depth_profile)
@@ -408,16 +485,117 @@ class OrbbecCamera:
                     print(f"[WARN] Failed to enable Orbbec frame sync: {exc}")
 
         self.pipeline.start(self.config)
+        if self.color_intrinsics is None:
+            self.color_intrinsics = self._extract_color_intrinsics(color_profile)
+        if self.color_intrinsics is None:
+            print("[WARN] Orbbec color camera intrinsics unavailable; RGB-D deprojection disabled.")
+        else:
+            print("[INFO] Orbbec color intrinsics:", self.color_intrinsics)
         return self
 
+    def _read_value(self, obj, names):
+        for name in names:
+            if obj is None or not hasattr(obj, name):
+                continue
+            value = getattr(obj, name)
+            try:
+                return value() if callable(value) else value
+            except Exception:
+                continue
+        return None
+
+    def _intrinsics_to_dict(self, intrinsics_obj, color_profile) -> Optional[Dict[str, float]]:
+        if intrinsics_obj is None:
+            return None
+
+        if isinstance(intrinsics_obj, dict):
+            fx = intrinsics_obj.get("fx", intrinsics_obj.get("focal_length_x"))
+            fy = intrinsics_obj.get("fy", intrinsics_obj.get("focal_length_y"))
+            cx = intrinsics_obj.get("cx", intrinsics_obj.get("principal_point_x"))
+            cy = intrinsics_obj.get("cy", intrinsics_obj.get("principal_point_y"))
+            width = intrinsics_obj.get("width")
+            height = intrinsics_obj.get("height")
+        else:
+            fx = self._read_value(intrinsics_obj, ["fx", "focal_length_x"])
+            fy = self._read_value(intrinsics_obj, ["fy", "focal_length_y"])
+            cx = self._read_value(intrinsics_obj, ["cx", "principal_point_x"])
+            cy = self._read_value(intrinsics_obj, ["cy", "principal_point_y"])
+            width = self._read_value(intrinsics_obj, ["width", "w"])
+            height = self._read_value(intrinsics_obj, ["height", "h"])
+
+        width = width if width is not None else self._read_value(color_profile, ["get_width", "width"])
+        height = height if height is not None else self._read_value(color_profile, ["get_height", "height"])
+        width = width if width is not None else self.width
+        height = height if height is not None else self.height
+
+        try:
+            intrinsics = {
+                "fx": float(fx),
+                "fy": float(fy),
+                "cx": float(cx),
+                "cy": float(cy),
+                "width": float(width),
+                "height": float(height),
+            }
+        except (TypeError, ValueError):
+            return None
+
+        if intrinsics["fx"] <= 0.0 or intrinsics["fy"] <= 0.0:
+            return None
+        return intrinsics
+
+    def _extract_color_intrinsics(self, color_profile) -> Optional[Dict[str, float]]:
+        # RGB-D camera coords 使用的是 Orbbec aligned depth + color image 像素坐标；
+        # 因此反投影必须使用 color camera intrinsics。
+        profile_methods = [
+            "get_intrinsic",
+            "get_intrinsics",
+            "get_camera_intrinsic",
+            "get_video_stream_intrinsic",
+        ]
+        for method_name in profile_methods:
+            if not hasattr(color_profile, method_name):
+                continue
+            try:
+                intrinsics = self._intrinsics_to_dict(getattr(color_profile, method_name)(), color_profile)
+                if intrinsics is not None:
+                    return intrinsics
+            except Exception as exc:
+                print(f"[WARN] Failed reading intrinsics from color profile via {method_name}: {exc}")
+
+        try:
+            camera_param = self.pipeline.get_camera_param()
+            for attr_name in [
+                "rgb_intrinsic",
+                "color_intrinsic",
+                "rgbIntrinsic",
+                "colorIntrinsic",
+                "left_intrinsic",
+            ]:
+                intrinsics_obj = self._read_value(camera_param, [attr_name])
+                intrinsics = self._intrinsics_to_dict(intrinsics_obj, color_profile)
+                if intrinsics is not None:
+                    return intrinsics
+        except Exception as exc:
+            print(f"[WARN] Failed reading intrinsics from pipeline camera param: {exc}")
+
+        return None
+
+    def get_color_intrinsics(self) -> Optional[Dict[str, float]]:
+        return self.color_intrinsics
+
     def _configure_align_mode(self):
+        # NONE: 完全禁用对齐，depth 保持原始深度视角。
         if self.align_mode == "NONE":
             self.config.set_align_mode(OBAlignMode.DISABLE)
             return
+        # SW: 使用软件对齐，兼容性好但可能更耗 CPU。
         if self.align_mode == "SW":
             self.config.set_align_mode(OBAlignMode.SW_MODE)
             return
 
+        # HW: 默认尝试硬件对齐；部分设备 PID 已知需要软件对齐。
+        # 如果查询设备信息失败，也回退到 SW，优先保证程序能跑起来。
         try:
             device = self.pipeline.get_device()
             device_pid = device.get_device_info().get_pid()
@@ -430,18 +608,24 @@ class OrbbecCamera:
             self.config.set_align_mode(OBAlignMode.SW_MODE)
 
     def read(self) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
-        frames = self.pipeline.wait_for_frames(100)
+        # wait_for_frames() 是 Orbbec examples 的典型取帧方式。
+        # 这里 timeout=500ms；超时返回 False，由主循环继续等待下一帧。
+        frames = self.pipeline.wait_for_frames(500)
         if frames is None:
             return False, None, None
 
+        # 彩色帧是必需的：没有 color frame，MediaPipe 没有输入图像。
         color_frame = frames.get_color_frame()
         if color_frame is None:
             return False, None, None
 
+        # 把 Orbbec color frame 统一转换为 OpenCV BGR。
         color_image = orbbec_frame_to_bgr_image(color_frame)
         if color_image is None:
             return False, None, None
 
+        # 深度帧是可选的：当前可视化主流程不直接使用 depth，
+        # 但保留 depth_mm 便于后续做 2D landmark + depth 的三维反投影。
         depth_mm = None
         if self.enable_depth:
             depth_frame = frames.get_depth_frame()
@@ -451,6 +635,7 @@ class OrbbecCamera:
         return True, color_image, depth_mm
 
     def stop(self):
+        # 退出时必须停止 pipeline，释放 Orbbec 设备句柄。
         self.pipeline.stop()
 
 
@@ -518,6 +703,109 @@ def lm_to_pixel(
     px = int(np.clip(x * width, 0, width - 1))
     py = int(np.clip(y * height, 0, height - 1))
     return px, py
+
+
+def deproject_pixel_to_camera(
+    u,
+    v,
+    depth_m,
+    intrinsics,
+) -> Optional[np.ndarray]:
+    # RGB-D camera coords:
+    # - 使用 MediaPipe 2D landmark 的原始相机像素坐标；
+    # - 结合 Orbbec aligned depth；
+    # - 再通过 pinhole camera model 反投影；
+    # - 输出坐标系是 Orbbec color/depth aligned 后的相机坐标系；
+    # - 单位是 meter。
+    if intrinsics is None:
+        return None
+    try:
+        z = float(depth_m)
+        fx = float(intrinsics["fx"])
+        fy = float(intrinsics["fy"])
+        cx = float(intrinsics["cx"])
+        cy = float(intrinsics["cy"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if z <= 0.0 or fx <= 0.0 or fy <= 0.0 or not np.isfinite(z):
+        return None
+
+    x = (float(u) - cx) * z / fx
+    y = (float(v) - cy) * z / fy
+    return np.array([x, y, z], dtype=np.float32)
+
+
+def landmark_to_camera_point(
+    lm,
+    frame_w: int,
+    frame_h: int,
+    depth_mm,
+    intrinsics,
+    mirror: bool = False,
+    search_radius: int = 3,
+) -> Optional[np.ndarray]:
+    # 反投影必须使用原始未镜像图像坐标。
+    # mirror 参数保留在签名里用于明确调用意图，但本函数强制用 mirror=False。
+    if depth_mm is None or intrinsics is None:
+        return None
+    if depth_mm.ndim != 2:
+        return None
+
+    u, v = lm_to_pixel(lm, frame_w, frame_h, mirror=False)
+    depth_h, depth_w = depth_mm.shape[:2]
+    if depth_w <= 0 or depth_h <= 0:
+        return None
+
+    u = int(np.clip(u, 0, depth_w - 1))
+    v = int(np.clip(v, 0, depth_h - 1))
+    depth_value = float(depth_mm[v, u])
+
+    if not np.isfinite(depth_value) or depth_value <= 0.0:
+        x0 = max(0, u - search_radius)
+        x1 = min(depth_w, u + search_radius + 1)
+        y0 = max(0, v - search_radius)
+        y1 = min(depth_h, v + search_radius + 1)
+        patch = depth_mm[y0:y1, x0:x1]
+        valid = patch[np.isfinite(patch) & (patch > 0.0)]
+        if valid.size == 0:
+            return None
+        depth_value = float(np.median(valid))
+
+    depth_m = depth_value / 1000.0
+    return deproject_pixel_to_camera(u, v, depth_m, intrinsics)
+
+
+def compute_rgbd_camera_landmarks(
+    lms,
+    depth_mm,
+    intrinsics,
+    frame_w: int,
+    frame_h: int,
+    visibility_threshold: float,
+) -> Dict[str, Optional[np.ndarray]]:
+    points = {name: None for name in RGBD_LANDMARK_NAMES}
+    if lms is None or depth_mm is None or intrinsics is None:
+        return points
+
+    for name in RGBD_LANDMARK_NAMES:
+        idx = IDX[name]
+        if idx >= len(lms) or get_visibility(lms[idx]) < visibility_threshold:
+            continue
+        try:
+            points[name] = landmark_to_camera_point(
+                lms[idx],
+                frame_w=frame_w,
+                frame_h=frame_h,
+                depth_mm=depth_mm,
+                intrinsics=intrinsics,
+                mirror=False,
+            )
+        except Exception as exc:
+            print(f"[WARN] RGB-D deprojection failed for {name}: {exc}")
+            points[name] = None
+
+    return points
 
 
 def lm_to_vec3(lms: List, index: int) -> np.ndarray:
@@ -680,6 +968,29 @@ def draw_pose_2d(
             put_text(img, str(i), (x + 4, y + 15), scale=0.35, color=(0, 255, 255), bg=True)
 
 
+def draw_rgbd_valid_points(
+    img: np.ndarray,
+    lms: Optional[List],
+    rgbd_camera_points: Optional[Dict[str, Optional[np.ndarray]]],
+    mirror: bool,
+    visibility_threshold: float,
+):
+    if lms is None or not rgbd_camera_points:
+        return
+
+    h, w = img.shape[:2]
+    for name in RIGHT_ARM_RGBD_NAMES:
+        point = rgbd_camera_points.get(name)
+        if point is None:
+            continue
+        idx = IDX[name]
+        if idx >= len(lms) or get_visibility(lms[idx]) < visibility_threshold:
+            continue
+        x, y = lm_to_pixel(lms[idx], w, h, mirror=mirror)
+        cv2.circle(img, (x, y), 8, (0, 255, 0), 2, cv2.LINE_AA)
+        put_text(img, "3D", (x + 8, y + 18), scale=0.38, color=(0, 255, 0), bg=True)
+
+
 def draw_normalized_skeleton_canvas(
     canvas: np.ndarray,
     lms: Optional[List],
@@ -784,6 +1095,8 @@ def build_info_panel(
     fps: float,
     lms: Optional[List],
     world_lms: Optional[List],
+    rgbd_camera_points: Optional[Dict[str, Optional[np.ndarray]]],
+    intrinsics_available: bool,
     angles: Dict[str, Optional[float]],
     threshold: float,
 ) -> Tuple[np.ndarray, int]:
@@ -804,6 +1117,7 @@ def build_info_panel(
         f"FPS: {fps:.1f}",
         f"visible landmarks: {visible_count}/33",
         f"world landmarks: {'yes' if world_lms is not None else 'no'}",
+        f"RGB-D intrinsics: {'yes' if intrinsics_available else 'unavailable'}",
     ]
 
     for line in lines:
@@ -853,6 +1167,15 @@ def build_info_panel(
     y += 14
     put_text(panel, "Right arm world landmarks", (12, y), scale=0.55, color=(0, 255, 255), bg=False)
     y += line_gap
+    put_text(
+        panel,
+        "MediaPipe estimated body-relative 3D, not Orbbec camera/depth",
+        (12, y),
+        scale=0.34,
+        color=(170, 220, 220),
+        bg=False,
+    )
+    y += 18
 
     if world_lms is None:
         put_text(panel, "no world landmarks", (12, y), scale=0.45, color=(120, 120, 120), bg=False)
@@ -921,6 +1244,80 @@ def build_info_panel(
         except Exception as e:
             put_text(panel, f"length calc failed: {e}", (12, y), scale=0.36, color=(80, 80, 255), bg=False)
 
+    y += 14
+    put_text(panel, "Right arm RGB-D camera coords", (12, y), scale=0.55, color=(0, 255, 0), bg=False)
+    y += line_gap
+    put_text(
+        panel,
+        "Orbbec aligned depth + pinhole camera, unit=m",
+        (12, y),
+        scale=0.36,
+        color=(170, 220, 170),
+        bg=False,
+    )
+    y += 18
+
+    if not intrinsics_available:
+        put_text(panel, "camera intrinsics unavailable", (12, y), scale=0.45, color=(80, 80, 255), bg=False)
+        y += 22
+    else:
+        rgbd_camera_points = rgbd_camera_points or {}
+        valid_count = sum(1 for name in RIGHT_ARM_RGBD_NAMES if rgbd_camera_points.get(name) is not None)
+        put_text(panel, f"RGB-D valid points: {valid_count}/6", (12, y), scale=0.45, color=(230, 230, 230), bg=False)
+        y += 22
+
+        col_name = 12
+        col_x = min(92, panel_w - 320)
+        col_y = min(190, panel_w - 220)
+        col_z = min(288, panel_w - 120)
+        put_text(panel, "point", (col_name, y), scale=0.38, color=(180, 180, 180), bg=False)
+        put_text(panel, "X", (col_x, y), scale=0.38, color=(180, 180, 180), bg=False)
+        put_text(panel, "Y", (col_y, y), scale=0.38, color=(180, 180, 180), bg=False)
+        put_text(panel, "Z", (col_z, y), scale=0.38, color=(180, 180, 180), bg=False)
+        y += 18
+
+        for name in RIGHT_ARM_RGBD_NAMES:
+            short_name = (
+                name.replace("RIGHT_", "R_")
+                    .replace("SHOULDER", "SHO")
+                    .replace("ELBOW", "ELB")
+                    .replace("WRIST", "WRI")
+                    .replace("INDEX", "IDX")
+                    .replace("THUMB", "THU")
+                    .replace("PINKY", "PIN")
+            )
+            point = rgbd_camera_points.get(name)
+            if point is None:
+                put_text(panel, f"{short_name}: --", (col_name, y), scale=0.38, color=(120, 120, 120), bg=False)
+            else:
+                put_text(panel, short_name, (col_name, y), scale=0.38, color=(255, 255, 255), bg=False)
+                put_text(panel, f"{point[0]:+.3f}", (col_x - 8, y), scale=0.38, color=(255, 255, 255), bg=False)
+                put_text(panel, f"{point[1]:+.3f}", (col_y - 8, y), scale=0.38, color=(255, 255, 255), bg=False)
+                put_text(panel, f"{point[2]:+.3f}", (col_z - 8, y), scale=0.38, color=(255, 255, 255), bg=False)
+            y += 18
+
+        r_shoulder = rgbd_camera_points.get("RIGHT_SHOULDER")
+        r_elbow = rgbd_camera_points.get("RIGHT_ELBOW")
+        r_wrist = rgbd_camera_points.get("RIGHT_WRIST")
+        y += 8
+        put_text(panel, "RGB-D segment length", (12, y), scale=0.45, color=(0, 255, 0), bg=False)
+        y += 20
+        if r_shoulder is not None and r_elbow is not None:
+            put_text(panel, f"upper arm RGB-D     : {np.linalg.norm(r_shoulder - r_elbow):.3f} m", (12, y), scale=0.38, color=(230, 230, 230), bg=False)
+        else:
+            put_text(panel, "upper arm RGB-D     : --", (12, y), scale=0.38, color=(120, 120, 120), bg=False)
+        y += 18
+        if r_elbow is not None and r_wrist is not None:
+            put_text(panel, f"forearm RGB-D       : {np.linalg.norm(r_elbow - r_wrist):.3f} m", (12, y), scale=0.38, color=(230, 230, 230), bg=False)
+        else:
+            put_text(panel, "forearm RGB-D       : --", (12, y), scale=0.38, color=(120, 120, 120), bg=False)
+        y += 18
+        if r_shoulder is not None and r_wrist is not None:
+            put_text(panel, f"shoulder-wrist RGB-D: {np.linalg.norm(r_shoulder - r_wrist):.3f} m", (12, y), scale=0.38, color=(230, 230, 230), bg=False)
+        else:
+            put_text(panel, "shoulder-wrist RGB-D: --", (12, y), scale=0.38, color=(120, 120, 120), bg=False)
+        y += 18
+
     return panel, y + 24
 
 
@@ -950,6 +1347,10 @@ def init_csv(csv_path: str):
         "world_z_m",
         "world_visibility",
         "world_presence",
+        "camera_x_m",
+        "camera_y_m",
+        "camera_z_m",
+        "camera_depth_valid",
     ])
 
     return csv_file, writer
@@ -961,6 +1362,7 @@ def write_csv(
     timestamp_ms: int,
     lms: Optional[List],
     world_lms: Optional[List],
+    rgbd_camera_points: Optional[Dict[str, Optional[np.ndarray]]] = None,
 ):
     if writer is None or lms is None:
         return
@@ -973,6 +1375,17 @@ def write_csv(
             wp = get_presence(wlm)
         else:
             wx, wy, wz, wvis, wp = "", "", "", "", ""
+
+        camera_point = None
+        camera_depth_valid = ""
+        if rgbd_camera_points is not None and LANDMARK_NAMES[i] in rgbd_camera_points:
+            camera_point = rgbd_camera_points.get(LANDMARK_NAMES[i])
+            camera_depth_valid = 1 if camera_point is not None else 0
+
+        if camera_point is not None:
+            camera_x, camera_y, camera_z = camera_point.tolist()
+        else:
+            camera_x, camera_y, camera_z = "", "", ""
 
         writer.writerow([
             frame_id,
@@ -989,6 +1402,10 @@ def write_csv(
             wz,
             wvis,
             wp,
+            camera_x,
+            camera_y,
+            camera_z,
+            camera_depth_valid,
         ])
 
 
@@ -998,12 +1415,15 @@ def write_csv(
 
 def main():
     args = parse_args()
+    # 把命令行参数整理成明确布尔变量，后面不要反复读 args。
     mirror = not args.no_mirror
     draw_names = not args.no_draw_names
     segmentation = not args.no_segmentation
+    # 兼容 --model-complexity：保持旧命令习惯，同时内部仍使用 Tasks 的模型名。
     if args.model_complexity is not None:
         args.model = {0: "lite", 1: "full", 2: "heavy"}[args.model_complexity]
 
+    # MediaPipe Tasks 模型加载：这里和 webcam 版本一致。
     model_path = ensure_model(
         model_name=args.model,
         model_path=args.model_path,
@@ -1017,6 +1437,8 @@ def main():
     PoseLandmarkerOptions = vision.PoseLandmarkerOptions
     VisionRunningMode = vision.RunningMode
 
+    # PoseLandmarker 仍使用 VIDEO 模式：
+    # 主循环每帧传入单调递增 timestamp_ms，MediaPipe 内部做视频追踪。
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=VisionRunningMode.VIDEO,
@@ -1027,6 +1449,8 @@ def main():
         output_segmentation_masks=segmentation,
     )
 
+    # 这里是 Orbbec 版本替代 webcam 版本的关键位置：
+    # 不再创建 cv2.VideoCapture，而是创建 OrbbecCamera 包装器。
     camera = OrbbecCamera(
         width=args.width,
         height=args.height,
@@ -1038,6 +1462,7 @@ def main():
 
     csv_file, csv_writer = init_csv(args.csv)
 
+    # paused=True 时，不继续从相机取新帧，而是复用 last_frame_bgr / last_result。
     paused = False
     frame_id = 0
     fps_smooth = 0.0
@@ -1075,9 +1500,15 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(window_name, on_mouse)
 
+    # MediaPipe landmarker 生命周期由 context manager 管理；
+    # 相机 pipeline 生命周期由 OrbbecCamera.start()/stop() 管理。
     with PoseLandmarker.create_from_options(options) as landmarker:
         while True:
             if not paused:
+                # Orbbec read() 返回：
+                # - ok: 本次是否拿到可用彩色帧；
+                # - frame_bgr: OpenCV BGR 彩色图；
+                # - depth_mm: 深度图，当前缓存但不改变既有 MediaPipe 可视化逻辑。
                 ok, frame_bgr, depth_mm = camera.read()
                 if not ok:
                     print("[WARN] failed to read frame from Orbbec camera")
@@ -1088,6 +1519,8 @@ def main():
                 last_depth_mm = depth_mm
 
                 # OpenCV 是 BGR，MediaPipe Image 需要 SRGB/RGB
+                # 这一步和 webcam 版本完全一致：只要上游给 frame_bgr，
+                # 后续 MediaPipe 调用不用关心图像来自 USB webcam 还是 Orbbec。
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 frame_rgb = np.ascontiguousarray(frame_rgb)
 
@@ -1102,6 +1535,7 @@ def main():
                 result = landmarker.detect_for_video(mp_image, timestamp_ms)
                 last_result = result
 
+                # 平滑 FPS 显示，避免每帧瞬时 FPS 抖动太明显。
                 now_t = time.time()
                 dt = now_t - last_t
                 last_t = now_t
@@ -1115,6 +1549,8 @@ def main():
             else:
                 if last_frame_bgr is None:
                     continue
+                # 暂停状态下沿用上一帧图像和上一帧 MediaPipe result，
+                # 这样可以冻结画面，同时仍能滚动右侧信息栏/保存截图。
                 frame_bgr = last_frame_bgr.copy()
                 depth_mm = last_depth_mm
                 result = last_result
@@ -1125,18 +1561,33 @@ def main():
             # 取第一人
             lms = None
             world_lms = None
+            rgbd_camera_points = {}
+            intrinsics = camera.get_color_intrinsics()
+            intrinsics_available = intrinsics is not None
             angles = {}
 
             if result is not None and result.pose_landmarks:
+                # 当前脚本只取第一个人体姿态。
+                # 如果 num_poses > 1，这里仍然只展示第 0 个结果，保持原可视化结构不变。
                 lms = result.pose_landmarks[0]
 
                 if result.pose_world_landmarks:
                     world_lms = result.pose_world_landmarks[0]
 
+                rgbd_camera_points = compute_rgbd_camera_landmarks(
+                    lms=lms,
+                    depth_mm=depth_mm,
+                    intrinsics=intrinsics,
+                    frame_w=frame_bgr.shape[1],
+                    frame_h=frame_bgr.shape[0],
+                    visibility_threshold=args.visibility_threshold,
+                )
+
                 if segmentation:
                     vis_frame = draw_segmentation_mask(vis_frame, result)
 
                 # 先镜像图像，再按镜像坐标画点
+                # draw_pose_2d 里也会根据 mirror 翻转 landmark 的 x 坐标。
                 if mirror:
                     vis_frame = cv2.flip(vis_frame, 1)
 
@@ -1148,11 +1599,20 @@ def main():
                     draw_names=draw_names,
                     show_index=args.show_index,
                 )
+                draw_rgbd_valid_points(
+                    img=vis_frame,
+                    lms=lms,
+                    rgbd_camera_points=rgbd_camera_points,
+                    mirror=mirror,
+                    visibility_threshold=args.visibility_threshold,
+                )
 
                 angles = calculate_angles(lms, args.visibility_threshold)
 
+                # CSV 保留原有 MediaPipe 字段，并在末尾追加 RGB-D camera coords 字段。
+                # 只有成功反投影的关键点会写 camera_x/y/z，其他 landmark 留空。
                 if not paused:
-                    write_csv(csv_writer, frame_id, timestamp_ms, lms, world_lms)
+                    write_csv(csv_writer, frame_id, timestamp_ms, lms, world_lms, rgbd_camera_points)
 
             else:
                 if mirror:
@@ -1168,6 +1628,8 @@ def main():
                 )
 
             status = "PAUSED" if paused else "RUNNING"
+            # 左上角状态条只显示全局运行状态，不承载复杂调试信息；
+            # 详细角度、visibility、world landmark 等都放在右侧滚动面板。
             put_text(
                 vis_frame,
                 f"{status} | FPS {fps_smooth:.1f} | model={args.model} | mirror={mirror} | seg={segmentation}",
@@ -1178,6 +1640,8 @@ def main():
             )
 
             # 右侧信息面板
+            # build_info_panel 负责文字信息，下面再把 skeleton/world 小视图接在文字之后。
+            # panel_full_h 是虚拟高度，最终只裁剪出一段 panel_view 拼到画面右侧。
             h, w = vis_frame.shape[:2]
             panel_w = max(420, args.panel_width)
             panel_full_h = max(h, args.panel_scroll_height)
@@ -1187,10 +1651,13 @@ def main():
                 fps=fps_smooth,
                 lms=lms,
                 world_lms=world_lms,
+                rgbd_camera_points=rgbd_camera_points,
+                intrinsics_available=intrinsics_available,
                 angles=angles,
                 threshold=args.visibility_threshold,
             )
             # 插入 2D skeleton canvas
+            # info_bottom_y 来自 build_info_panel，可避免 skeleton 盖住状态文字。
             margin = 10
             view_w = panel_w - 2 * margin
             skeleton_h = max(160, int(h * 0.28))
@@ -1199,6 +1666,8 @@ def main():
             skeleton_y0 = info_bottom_y + 24
             world_y0 = skeleton_y0 + skeleton_h + 12
             required_panel_h = world_y0 + world_h + 20
+            # 如果文字 + skeleton + world panels 超出初始虚拟面板高度，
+            # 这里动态扩展右侧面板，滚动条范围随后会自动变大。
             if required_panel_h > panel.shape[0]:
                 extra_h = required_panel_h - panel.shape[0]
                 extra_panel = np.zeros((extra_h, panel_w, 3), dtype=np.uint8)
@@ -1206,6 +1675,8 @@ def main():
                 panel = np.vstack([panel, extra_panel])
                 panel_full_h = panel.shape[0]
 
+            # normalized skeleton 使用 MediaPipe normalized landmarks；
+            # 这里显示的是 2D 归一化人体骨架，不是相机深度坐标。
             if skeleton_y0 + skeleton_h < panel_full_h:
                 skeleton_canvas = np.zeros((skeleton_h, view_w, 3), dtype=np.uint8)
                 draw_normalized_skeleton_canvas(
@@ -1219,6 +1690,8 @@ def main():
                     margin:margin + view_w,
                 ] = skeleton_canvas
 
+            # world front/side 使用 MediaPipe pose_world_landmarks，
+            # 它是 MediaPipe 估计的人体相对三维坐标，不是 Orbbec depth map。
             if world_y0 + world_h < panel_full_h:
                 half_w = (view_w - 8) // 2
                 front_canvas = np.zeros((world_h, half_w, 3), dtype=np.uint8)
@@ -1247,6 +1720,7 @@ def main():
                     margin + half_w + 8:margin + 2 * half_w + 8,
                 ] = side_canvas
 
+            # 根据当前滚动偏移，从右侧虚拟长面板中裁剪出与主画面同高的一段。
             panel_scroll["max"] = max(0, panel_full_h - h)
             panel_scroll["offset"] = int(
                 np.clip(panel_scroll["offset"], 0, panel_scroll["max"])
@@ -1254,6 +1728,7 @@ def main():
             scroll_y = panel_scroll["offset"]
             panel_view = panel[scroll_y:scroll_y + h, :].copy()
 
+            # 画一个简易滚动条，提示当前右侧状态栏的位置。
             if panel_scroll["max"] > 0:
                 track_x = panel_w - 8
                 cv2.rectangle(panel_view, (track_x, 4), (track_x + 4, h - 4), (70, 70, 70), -1)
@@ -1277,6 +1752,7 @@ def main():
 
             final_vis = np.hstack([vis_frame, panel_view])
 
+            # display_scale 是最终合成图的显示缩放，不影响 MediaPipe 输入分辨率。
             if args.display_scale != 1.0:
                 scale = float(np.clip(args.display_scale, 0.25, 1.5))
                 final_vis = cv2.resize(
@@ -1294,6 +1770,7 @@ def main():
             if key == ord("q") or key == 27:
                 break
 
+            # w/s 或方向键用于滚动右侧虚拟面板。
             if key in (ord("w"), 82):
                 panel_scroll["offset"] = int(
                     np.clip(panel_scroll["offset"] - 70, 0, panel_scroll["max"])
@@ -1308,6 +1785,7 @@ def main():
                 paused = not paused
                 print("[INFO] paused =", paused)
 
+            # 截图保存的是最终合成窗口：左侧彩色姿态画面 + 右侧当前滚动位置的状态栏。
             if key == ord("c"):
                 os.makedirs("screenshots", exist_ok=True)
                 save_path = os.path.join("screenshots", f"pose_v2_{now_string()}.jpg")

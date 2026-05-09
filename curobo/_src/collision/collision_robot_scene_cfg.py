@@ -17,10 +17,10 @@ from curobo._src.cost.cost_scene_collision import SceneCollisionCost
 from curobo._src.cost.cost_scene_collision_cfg import SceneCollisionCostCfg
 from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
-from curobo._src.geom.collision import (
+from curobo._src.geom.collision.collision_scene import (
     SceneCollision,
     SceneCollisionCfg,
-    create_collision_checker,
+    create_scene_collision,
 )
 from curobo._src.geom.types import SceneCfg
 
@@ -28,7 +28,7 @@ from curobo._src.geom.types import SceneCfg
 from curobo._src.robot.kinematics.kinematics import Kinematics
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.robot import RobotCfg
-from curobo._src.util.sampling import SampleBuffer
+from curobo._src.util.sampling.sample_buffer import SampleBuffer
 from curobo._src.util.warp import init_warp
 from curobo._src.util_file import (
     get_robot_configs_path,
@@ -142,7 +142,7 @@ class RobotSceneCollisionCfg:
                 max_distance=max_collision_distance,
                 cache={"mesh": n_meshes, "primitive": n_cuboids},
             )
-            scene_collision_checker = create_collision_checker(world_cfg)
+            scene_collision_checker = create_scene_collision(world_cfg)
 
         if scene_collision_checker is not None:
             collision_cost_config = SceneCollisionCostCfg(
@@ -150,6 +150,7 @@ class RobotSceneCollisionCfg:
                 device_cfg=device_cfg,
                 use_grad_input=False,
                 activation_distance=collision_activation_distance,
+                num_spheres=kinematics.total_spheres,
                 _scene_collision_checker=scene_collision_checker,
             )
             scene_collision_cost = SceneCollisionCost(collision_cost_config)
@@ -158,6 +159,7 @@ class RobotSceneCollisionCfg:
                 device_cfg=device_cfg,
                 use_grad_input=True,
                 activation_distance=0.0,
+                num_spheres=kinematics.total_spheres,
             )
             collision_constraint_config.scene_collision_checker = scene_collision_checker
             scene_collision_constraint = SceneCollisionCost(collision_constraint_config)
@@ -214,4 +216,3 @@ class RobotSceneCollisionCfg:
             device_cfg=device_cfg,
             contact_distance=dist_threshold,
         )
-
