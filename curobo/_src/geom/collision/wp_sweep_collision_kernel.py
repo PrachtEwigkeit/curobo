@@ -30,7 +30,7 @@ Kernels:
 # =============================================================================
 #
 # Registers SDF function overloads from all obstacle data modules.
-# Module list is centralized in curobo._src.geom.data.OBSTACLE_SDF_MODULES.
+# Module list is centralized in curobo._src.geom.data.registry.OBSTACLE_SDF_MODULES.
 #
 # How it works:
 # - wp.func uses scope_locals.get(func.func.__name__) to find existing Functions
@@ -47,7 +47,7 @@ from curobo._src.geom.collision.wp_collision_common import (
     apply_collision_activation,
     load_sphere_query,
 )
-from curobo._src.geom.data import OBSTACLE_SDF_MODULES
+from curobo._src.geom.data.registry import OBSTACLE_SDF_MODULES
 
 # Initialize to None - will be set by first iteration
 is_obs_enabled = None
@@ -201,11 +201,12 @@ def swept_sphere_obstacle_collision_kernel(
             t = 1.0 - 0.5 * jump * inv_half_dist
             local_pt = t * local_current + (1.0 - t) * local_prev
 
-            sdf = compute_local_sdf(obs, env_idx, obs_local_idx, local_pt)
-            penetration = -sdf + radius_adjusted
+            # Use one SDF overload in the sweep loops to avoid invalid Warp
+            # codegen for VoxelDataWarp when both overloads are mixed here.
+            sdf_result = compute_local_sdf_with_grad(obs, env_idx, obs_local_idx, local_pt)
+            penetration = -sdf_result[0] + radius_adjusted
 
             if penetration > 0.0:
-                sdf_result = compute_local_sdf_with_grad(obs, env_idx, obs_local_idx, local_pt)
                 activation_result = apply_collision_activation(penetration, eta)
                 cost_sum += activation_result[0]
                 grad_sum_local += activation_result[1] * wp.vec3(sdf_result[1], sdf_result[2], sdf_result[3])
@@ -231,11 +232,11 @@ def swept_sphere_obstacle_collision_kernel(
             t = 1.0 - 0.5 * jump * inv_half_dist
             local_pt = t * local_current + (1.0 - t) * local_next
 
-            sdf = compute_local_sdf(obs, env_idx, obs_local_idx, local_pt)
-            penetration = -sdf + radius_adjusted
+            # See previous sweep loop for why this uses the with-grad overload.
+            sdf_result = compute_local_sdf_with_grad(obs, env_idx, obs_local_idx, local_pt)
+            penetration = -sdf_result[0] + radius_adjusted
 
             if penetration > 0.0:
-                sdf_result = compute_local_sdf_with_grad(obs, env_idx, obs_local_idx, local_pt)
                 activation_result = apply_collision_activation(penetration, eta)
                 cost_sum += activation_result[0]
                 grad_sum_local += activation_result[1] * wp.vec3(sdf_result[1], sdf_result[2], sdf_result[3])
