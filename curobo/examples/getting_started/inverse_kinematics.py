@@ -191,7 +191,7 @@ def single_ik_example():
     target_link = ik.tool_frames[0]
 
     goal_pose = Pose(
-        position=torch.tensor([[0.4, 0.0, 0.4]], device="cuda", dtype=torch.float32),
+        position=torch.tensor([[0.45, 0.5, 0.55]], device="cuda", dtype=torch.float32),
         quaternion=torch.tensor([[1.0, 0.0, 0.0, 0.0]], device="cuda", dtype=torch.float32),
     )
 

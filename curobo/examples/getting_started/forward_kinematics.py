@@ -87,7 +87,8 @@ def forward_kinematics_example():
     print(f"Tool frames: {robot.tool_frames}")
 
     # Single FK
-    q = torch.zeros(1, robot.get_dof(), device="cuda", dtype=torch.float32)
+    # q = torch.zeros(1, robot.get_dof(), device="cuda", dtype=torch.float32)
+    q = torch.tensor([[0.5187851540318142, 0.4210684661244466, 0.43694853278298584, -1.2250396736637912, -0.17426041335415565, 1.6103871877125275, 1.7140791635220287]],device="cuda",dtype=torch.float32)
     state = robot.compute_kinematics(
         JointState.from_position(q, joint_names=robot.joint_names)
     )
