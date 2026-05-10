@@ -18,12 +18,14 @@ MediaPipe Pose Landmarker V2 Orbbec Visualizer
 7. 显示 FPS、关键点 visibility
 8. 可保存截图
 9. 可保存 landmarks 到 CSV
+10. 可选通过 UDP 发布 RGB-D 反投影得到的右腕/手部目标点
 
 按键：
     q / ESC : 退出
     p       : 暂停 / 继续
     w / s   : 上下滚动右侧信息栏
     c       : 保存截图
+    r       : 重置 UDP 发布用的人体初始目标点
 
 示例：
     python mediapipe_pose_orbbec_visualizer.py --width 1280 --height 720 --model full
@@ -31,8 +33,10 @@ MediaPipe Pose Landmarker V2 Orbbec Visualizer
 
 import argparse
 import csv
+import json
 import math
 import os
+import socket
 import time
 import urllib.request
 from datetime import datetime
@@ -277,6 +281,25 @@ def parse_args():
     parser.add_argument("--no-mirror", action="store_true", default=False)
     parser.add_argument("--csv", type=str, default="")
     parser.add_argument("--show-index", action="store_true")
+
+    # UDP 发布只负责把感知侧目标点发出去：
+    # - 不做 cuRobo IK；
+    # - 不做机器人控制；
+    # - 不引入 ROS/ZeroMQ，保持脚本和下游控制程序低耦合。
+    parser.add_argument("--udp-publish", action="store_true", default=True)
+    parser.add_argument("--udp-host", type=str, default="127.0.0.1")
+    parser.add_argument("--udp-port", type=int, default=5557)
+    parser.add_argument("--udp-frame", type=str, default="orbbec_color_optical_frame")
+    parser.add_argument(
+        "--publish-target",
+        type=str,
+        default="right_wrist",
+        choices=["right_wrist", "right_index", "right_thumb"],
+    )
+    parser.add_argument("--teleop-scale", type=float, default=1.0)
+    parser.add_argument("--publish-delta", action="store_true", default=False)
+    parser.add_argument("--reset-origin-key", type=str, default="r")
+
     # 右侧信息栏参数：panel-width 控制横向宽度；
     # panel-scroll-height 控制右侧虚拟画布高度，内容多时用滚轮/w/s 滚动查看。
     parser.add_argument(
@@ -806,6 +829,112 @@ def compute_rgbd_camera_landmarks(
             points[name] = None
 
     return points
+
+
+# ============================================================
+# UDP target publisher
+# ============================================================
+
+PUBLISH_TARGET_TO_LANDMARK = {
+    "right_wrist": "RIGHT_WRIST",
+    "right_index": "RIGHT_INDEX",
+    "right_thumb": "RIGHT_THUMB",
+}
+
+
+def publish_target_to_landmark_name(publish_target: str) -> str:
+    return PUBLISH_TARGET_TO_LANDMARK.get(publish_target, "RIGHT_WRIST")
+
+
+class UdpJsonPublisher:
+    # 这个 publisher 只负责发布感知目标：
+    # - 数据来源是 RGB-D camera coords，也就是 MediaPipe 2D landmark + Orbbec aligned depth；
+    # - 不使用 MediaPipe pose_world_landmarks 当作相机坐标；
+    # - 不做 cuRobo IK，不做机器人控制，不做外参变换。
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = int(port)
+        self.addr = (self.host, self.port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        self.last_warn_t = 0.0
+
+    def publish(self, packet: dict):
+        try:
+            payload = json.dumps(packet, separators=(",", ":")).encode("utf-8")
+            self.sock.sendto(payload, self.addr)
+        except Exception as exc:
+            now_t = time.time()
+            if now_t - self.last_warn_t > 1.0:
+                print(f"[WARN] UDP publish failed: {exc}")
+                self.last_warn_t = now_t
+
+    def close(self):
+        self.sock.close()
+
+
+def _point_to_list(point: np.ndarray) -> List[float]:
+    return [float(point[0]), float(point[1]), float(point[2])]
+
+
+def make_wrist_udp_packet(
+    frame_id: int,
+    timestamp_ms: int,
+    rgbd_camera_points: dict,
+    lms,
+    frame_name: str,
+    publish_target: str,
+    visibility_threshold: float,
+    origin_point: Optional[np.ndarray],
+    publish_delta: bool,
+    teleop_scale: float,
+) -> dict:
+    landmark_name = publish_target_to_landmark_name(publish_target)
+    point = None
+    if rgbd_camera_points is not None:
+        point = rgbd_camera_points.get(landmark_name)
+
+    visibility = None
+    idx = IDX.get(landmark_name)
+    if lms is not None and idx is not None and idx < len(lms):
+        visibility = float(get_visibility(lms[idx]))
+
+    valid = (
+        point is not None
+        and visibility is not None
+        and visibility >= visibility_threshold
+    )
+
+    position_camera_m = None
+    delta_camera_m = None
+    target_position_m = None
+
+    if valid:
+        point = np.asarray(point, dtype=np.float32)
+        position_camera_m = _point_to_list(point)
+
+        if publish_delta:
+            if origin_point is not None:
+                delta = point - np.asarray(origin_point, dtype=np.float32)
+                target = float(teleop_scale) * delta
+                delta_camera_m = _point_to_list(delta)
+                target_position_m = _point_to_list(target)
+        else:
+            target_position_m = position_camera_m
+
+    return {
+        "stamp_ms": int(timestamp_ms),
+        "frame_id": int(frame_id),
+        "valid": bool(valid),
+        "source_frame": str(frame_name),
+        "landmark_name": landmark_name,
+        "position_camera_m": position_camera_m,
+        "delta_camera_m": delta_camera_m,
+        "target_position_m": target_position_m,
+        "visibility": visibility,
+        "teleop_scale": float(teleop_scale),
+        "publish_delta": bool(publish_delta),
+    }
 
 
 def lm_to_vec3(lms: List, index: int) -> np.ndarray:
@@ -1462,6 +1591,18 @@ def main():
 
     csv_file, csv_writer = init_csv(args.csv)
 
+    if args.udp_publish:
+        udp_pub = UdpJsonPublisher(args.udp_host, args.udp_port)
+        print(f"[INFO] UDP publishing enabled: {args.udp_host}:{args.udp_port}")
+    else:
+        udp_pub = None
+
+    # wrist_origin 是 publish_delta 模式的零点。
+    # 第一帧目标点有效时自动设置；也可以按 reset-origin-key 手动重置。
+    wrist_origin = None
+    last_udp_warn_t = 0.0
+    udp_last_valid = False
+
     # paused=True 时，不继续从相机取新帧，而是复用 last_frame_bgr / last_result。
     paused = False
     frame_id = 0
@@ -1474,7 +1615,10 @@ def main():
     last_result = None
 
     print("[INFO] Started.")
-    print("[INFO] Keys: q/ESC quit, p pause/resume, w/s scroll panel, c screenshot")
+    print(
+        "[INFO] Keys: q/ESC quit, p pause/resume, w/s scroll panel, "
+        f"c screenshot, {args.reset_origin_key} reset UDP origin"
+    )
     print("[INFO] Mouse wheel or w/s: scroll right information panel")
     print(f"[INFO] mirror={mirror}, segmentation={segmentation}, draw_names={draw_names}")
 
@@ -1621,11 +1765,40 @@ def main():
                 put_text(
                     vis_frame,
                     "No pose detected",
-                    (16, 70),
+                    (16, 92),
                     scale=0.75,
                     color=(0, 0, 255),
                     bg=True,
                 )
+
+            if udp_pub is not None:
+                # UDP 发布的是 RGB-D camera coords：Orbbec aligned depth + color 像素反投影。
+                # 这里故意不使用 MediaPipe pose_world_landmarks，也不在本脚本里做 IK/控制。
+                target_landmark_name = publish_target_to_landmark_name(args.publish_target)
+                current_point = None
+                if rgbd_camera_points is not None:
+                    current_point = rgbd_camera_points.get(target_landmark_name)
+
+                if current_point is not None and wrist_origin is None:
+                    wrist_origin = np.asarray(current_point, dtype=np.float32).copy()
+                    print(f"[INFO] Auto set UDP origin ({target_landmark_name}): {wrist_origin.tolist()}")
+
+                udp_packet = make_wrist_udp_packet(
+                    frame_id=frame_id,
+                    timestamp_ms=timestamp_ms,
+                    rgbd_camera_points=rgbd_camera_points,
+                    lms=lms,
+                    frame_name=args.udp_frame,
+                    publish_target=args.publish_target,
+                    visibility_threshold=args.visibility_threshold,
+                    origin_point=wrist_origin,
+                    publish_delta=args.publish_delta,
+                    teleop_scale=args.teleop_scale,
+                )
+                udp_pub.publish(udp_packet)
+                udp_last_valid = bool(udp_packet.get("valid", False))
+            else:
+                udp_last_valid = False
 
             status = "PAUSED" if paused else "RUNNING"
             # 左上角状态条只显示全局运行状态，不承载复杂调试信息；
@@ -1636,6 +1809,17 @@ def main():
                 (16, 32),
                 scale=0.62,
                 color=(0, 255, 255),
+                bg=True,
+            )
+            udp_status_text = "UDP: off"
+            if udp_pub is not None:
+                udp_status_text = f"UDP: {args.udp_host}:{args.udp_port} valid={udp_last_valid}"
+            put_text(
+                vis_frame,
+                udp_status_text,
+                (16, 58),
+                scale=0.50,
+                color=(0, 255, 0) if udp_pub is not None else (160, 160, 160),
                 bg=True,
             )
 
@@ -1785,6 +1969,22 @@ def main():
                 paused = not paused
                 print("[INFO] paused =", paused)
 
+            reset_key = (args.reset_origin_key or "r").lower()[:1]
+            if reset_key and key == ord(reset_key):
+                target_landmark_name = publish_target_to_landmark_name(args.publish_target)
+                current_point = None
+                if rgbd_camera_points is not None:
+                    current_point = rgbd_camera_points.get(target_landmark_name)
+
+                if current_point is not None:
+                    wrist_origin = np.asarray(current_point, dtype=np.float32).copy()
+                    print(f"[INFO] Reset wrist origin ({target_landmark_name}): {wrist_origin.tolist()}")
+                else:
+                    now_t = time.time()
+                    if now_t - last_udp_warn_t > 0.5:
+                        print(f"[WARN] Cannot reset wrist origin: {target_landmark_name} is invalid")
+                        last_udp_warn_t = now_t
+
             # 截图保存的是最终合成窗口：左侧彩色姿态画面 + 右侧当前滚动位置的状态栏。
             if key == ord("c"):
                 os.makedirs("screenshots", exist_ok=True)
@@ -1793,6 +1993,8 @@ def main():
                 print("[INFO] saved screenshot:", save_path)
 
     camera.stop()
+    if udp_pub is not None:
+        udp_pub.close()
     cv2.destroyAllWindows()
 
     if csv_file is not None:
