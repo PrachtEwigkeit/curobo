@@ -19,6 +19,7 @@ MediaPipe Pose Landmarker V2 Orbbec Visualizer
 8. 可保存截图
 9. 可保存 landmarks 到 CSV
 10. 可选通过 UDP 发布 RGB-D 反投影得到的右腕/手部目标点
+11. 可选运行 Hand Landmarker，估计视觉侧 palm frame 和相对旋转
 
 按键：
     q / ESC : 退出
@@ -26,6 +27,7 @@ MediaPipe Pose Landmarker V2 Orbbec Visualizer
     w / s   : 上下滚动右侧信息栏
     c       : 保存截图
     r       : 重置 UDP 发布用的人体初始目标点
+    o       : 重置 palm orientation origin
 
 示例：
     python mediapipe_pose_orbbec_visualizer.py --width 1280 --height 720 --model full
@@ -39,6 +41,7 @@ import os
 import socket
 import time
 import urllib.request
+from contextlib import ExitStack
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -170,6 +173,60 @@ RGBD_LANDMARK_NAMES = RIGHT_ARM_RGBD_NAMES + [
     "LEFT_WRIST",
 ]
 
+# MediaPipe HandLandmarker 固定输出 21 个手部关键点。
+# palm frame 是视觉侧估计的手掌姿态，不是严格解剖意义 wrist joint rotation。
+HAND_LANDMARK_NAMES = [
+    "WRIST",
+    "THUMB_CMC",
+    "THUMB_MCP",
+    "THUMB_IP",
+    "THUMB_TIP",
+    "INDEX_FINGER_MCP",
+    "INDEX_FINGER_PIP",
+    "INDEX_FINGER_DIP",
+    "INDEX_FINGER_TIP",
+    "MIDDLE_FINGER_MCP",
+    "MIDDLE_FINGER_PIP",
+    "MIDDLE_FINGER_DIP",
+    "MIDDLE_FINGER_TIP",
+    "RING_FINGER_MCP",
+    "RING_FINGER_PIP",
+    "RING_FINGER_DIP",
+    "RING_FINGER_TIP",
+    "PINKY_MCP",
+    "PINKY_PIP",
+    "PINKY_DIP",
+    "PINKY_TIP",
+]
+
+HAND_IDX = {name: i for i, name in enumerate(HAND_LANDMARK_NAMES)}
+
+HAND_CONNECTIONS = [
+    (HAND_IDX["WRIST"], HAND_IDX["THUMB_CMC"]),
+    (HAND_IDX["THUMB_CMC"], HAND_IDX["THUMB_MCP"]),
+    (HAND_IDX["THUMB_MCP"], HAND_IDX["THUMB_IP"]),
+    (HAND_IDX["THUMB_IP"], HAND_IDX["THUMB_TIP"]),
+    (HAND_IDX["WRIST"], HAND_IDX["INDEX_FINGER_MCP"]),
+    (HAND_IDX["INDEX_FINGER_MCP"], HAND_IDX["INDEX_FINGER_PIP"]),
+    (HAND_IDX["INDEX_FINGER_PIP"], HAND_IDX["INDEX_FINGER_DIP"]),
+    (HAND_IDX["INDEX_FINGER_DIP"], HAND_IDX["INDEX_FINGER_TIP"]),
+    (HAND_IDX["WRIST"], HAND_IDX["MIDDLE_FINGER_MCP"]),
+    (HAND_IDX["MIDDLE_FINGER_MCP"], HAND_IDX["MIDDLE_FINGER_PIP"]),
+    (HAND_IDX["MIDDLE_FINGER_PIP"], HAND_IDX["MIDDLE_FINGER_DIP"]),
+    (HAND_IDX["MIDDLE_FINGER_DIP"], HAND_IDX["MIDDLE_FINGER_TIP"]),
+    (HAND_IDX["WRIST"], HAND_IDX["RING_FINGER_MCP"]),
+    (HAND_IDX["RING_FINGER_MCP"], HAND_IDX["RING_FINGER_PIP"]),
+    (HAND_IDX["RING_FINGER_PIP"], HAND_IDX["RING_FINGER_DIP"]),
+    (HAND_IDX["RING_FINGER_DIP"], HAND_IDX["RING_FINGER_TIP"]),
+    (HAND_IDX["WRIST"], HAND_IDX["PINKY_MCP"]),
+    (HAND_IDX["PINKY_MCP"], HAND_IDX["PINKY_PIP"]),
+    (HAND_IDX["PINKY_PIP"], HAND_IDX["PINKY_DIP"]),
+    (HAND_IDX["PINKY_DIP"], HAND_IDX["PINKY_TIP"]),
+    (HAND_IDX["INDEX_FINGER_MCP"], HAND_IDX["MIDDLE_FINGER_MCP"]),
+    (HAND_IDX["MIDDLE_FINGER_MCP"], HAND_IDX["RING_FINGER_MCP"]),
+    (HAND_IDX["RING_FINGER_MCP"], HAND_IDX["PINKY_MCP"]),
+]
+
 
 MODEL_URLS = {
     "lite": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
@@ -184,6 +241,12 @@ MODEL_FILES = {
     "full": "pose_landmarker_full.task",
     "heavy": "pose_landmarker_heavy.task",
 }
+
+HAND_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/latest/hand_landmarker.task"
+)
+HAND_MODEL_FILE = "hand_landmarker.task"
 
 
 # ============================================================
@@ -268,6 +331,26 @@ def parse_args():
     parser.add_argument("--min-presence-confidence", type=float, default=0.5)
     parser.add_argument("--min-tracking-confidence", type=float, default=0.5)
     parser.add_argument("--visibility-threshold", type=float, default=0.45)
+
+    parser.add_argument("--enable-hand", action="store_true", default=True)
+    parser.add_argument("--disable-hand", action="store_true", default=False)
+    parser.add_argument("--hand-model-path", type=str, default="")
+    parser.add_argument("--hand-models-dir", type=str, default="models")
+    parser.add_argument("--num-hands", type=int, default=1)
+    parser.add_argument("--min-hand-detection-confidence", type=float, default=0.5)
+    parser.add_argument("--min-hand-presence-confidence", type=float, default=0.5)
+    parser.add_argument("--min-hand-tracking-confidence", type=float, default=0.5)
+    parser.add_argument("--handedness", type=str, default="Right", choices=["Right", "Left", "Any"])
+    parser.add_argument("--palm-depth-radius", type=int, default=5)
+    parser.add_argument("--draw-hand", action="store_true", default=True)
+    parser.add_argument("--no-draw-hand", action="store_true", default=False)
+    parser.add_argument("--draw-palm-frame", action="store_true", default=True)
+    parser.add_argument("--palm-frame-axis-length", type=float, default=0.08)
+    parser.add_argument("--hand-every-n-frames", type=int, default=1)
+    parser.add_argument("--palm-auto-init", action="store_true", default=True)
+    parser.add_argument("--palm-reset-key", type=str, default="o")
+    parser.add_argument("--palm-filter-alpha", type=float, default=0.25)
+    parser.add_argument("--palm-max-angle-step-deg", type=float, default=15.0)
 
     # 旧版参数保留但隐藏在 help 中，避免历史命令直接报错。
     # 实际开关采用下面的 --no-draw-names / --no-segmentation 语义。
@@ -358,6 +441,34 @@ def ensure_model(model_name: str, model_path: str, models_dir: str) -> str:
             f"mkdir -p {models_dir}\n"
             f"wget -O {local_path} '{url}'\n"
             "然后重新运行脚本。\n"
+            f"原始错误: {e}"
+        ) from e
+
+    return local_path
+
+
+def ensure_hand_model(model_path: str, models_dir: str) -> str:
+    if model_path:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"指定的手部模型文件不存在: {model_path}")
+        return model_path
+
+    os.makedirs(models_dir, exist_ok=True)
+    local_path = os.path.join(models_dir, HAND_MODEL_FILE)
+    if os.path.exists(local_path):
+        return local_path
+
+    print(f"[INFO] 手部模型不存在，开始下载: {HAND_MODEL_URL}")
+    print(f"[INFO] 保存到: {local_path}")
+    try:
+        urllib.request.urlretrieve(HAND_MODEL_URL, local_path)
+    except Exception as e:
+        raise RuntimeError(
+            "手部模型自动下载失败。\n"
+            "你可以手动执行：\n"
+            f"mkdir -p {models_dir}\n"
+            f"wget -O {local_path} '{HAND_MODEL_URL}'\n"
+            "然后重新运行脚本，或使用 --disable-hand 关闭手部检测。\n"
             f"原始错误: {e}"
         ) from e
 
@@ -832,6 +943,481 @@ def compute_rgbd_camera_landmarks(
 
 
 # ============================================================
+# Hand Landmarker palm frame utilities
+# ============================================================
+
+def select_hand_result(hand_result, handedness: str):
+    if hand_result is None or not getattr(hand_result, "hand_landmarks", None):
+        return None
+
+    hand_lms_list = hand_result.hand_landmarks
+    hand_world_list = getattr(hand_result, "hand_world_landmarks", None)
+    handedness_list = getattr(hand_result, "handedness", None)
+
+    candidates = []
+    for i, hand_lms in enumerate(hand_lms_list):
+        label = "Unknown"
+        score = 0.0
+        if handedness_list is not None and i < len(handedness_list) and handedness_list[i]:
+            category = handedness_list[i][0]
+            label = (
+                getattr(category, "category_name", None)
+                or getattr(category, "display_name", None)
+                or getattr(category, "label", None)
+                or "Unknown"
+            )
+            score = float(getattr(category, "score", 0.0))
+
+        hand_world_lms = None
+        if hand_world_list is not None and i < len(hand_world_list):
+            hand_world_lms = hand_world_list[i]
+
+        candidates.append(
+            {
+                "hand_lms": hand_lms,
+                "hand_world_lms": hand_world_lms,
+                "handedness_label": str(label),
+                "handedness_score": score,
+            }
+        )
+
+    if not candidates:
+        return None
+    if handedness == "Any":
+        return candidates[0]
+
+    for item in candidates:
+        if item["handedness_label"].lower() == handedness.lower():
+            return item
+    return candidates[0]
+
+
+def hand_landmark_to_camera_point(
+    hand_lm,
+    frame_w: int,
+    frame_h: int,
+    depth_mm,
+    intrinsics,
+    search_radius: int = 5,
+) -> Optional[np.ndarray]:
+    # HandLandmarker 的 hand_lm.x/y 也是 normalized image coordinate。
+    # 反投影必须使用原始未镜像图像坐标，与 aligned depth 一致。
+    return landmark_to_camera_point(
+        hand_lm,
+        frame_w=frame_w,
+        frame_h=frame_h,
+        depth_mm=depth_mm,
+        intrinsics=intrinsics,
+        mirror=False,
+        search_radius=search_radius,
+    )
+
+
+def compute_hand_camera_points(
+    hand_lms,
+    depth_mm,
+    intrinsics,
+    frame_w: int,
+    frame_h: int,
+    search_radius: int,
+) -> Dict[str, Optional[np.ndarray]]:
+    points = {name: None for name in HAND_LANDMARK_NAMES}
+    if hand_lms is None or depth_mm is None or intrinsics is None:
+        return points
+
+    for name, idx in HAND_IDX.items():
+        if idx >= len(hand_lms):
+            continue
+        try:
+            points[name] = hand_landmark_to_camera_point(
+                hand_lms[idx],
+                frame_w=frame_w,
+                frame_h=frame_h,
+                depth_mm=depth_mm,
+                intrinsics=intrinsics,
+                search_radius=search_radius,
+            )
+        except Exception as exc:
+            print(f"[WARN] Hand RGB-D deprojection failed for {name}: {exc}")
+            points[name] = None
+    return points
+
+
+def normalize_vec(v, eps=1e-8) -> Optional[np.ndarray]:
+    v = np.asarray(v, dtype=np.float32)
+    n = float(np.linalg.norm(v))
+    if not np.isfinite(n) or n < eps:
+        return None
+    return v / n
+
+
+def project_to_so3(R: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        U, _S, Vt = np.linalg.svd(np.asarray(R, dtype=np.float32))
+        R_so3 = U @ Vt
+        if np.linalg.det(R_so3) < 0.0:
+            U[:, -1] *= -1.0
+            R_so3 = U @ Vt
+    except Exception:
+        return None
+    if not np.all(np.isfinite(R_so3)):
+        return None
+    return R_so3.astype(np.float32)
+
+
+def compute_palm_frame_from_points(hand_points_camera: Dict[str, Optional[np.ndarray]]) -> dict:
+    required = ["WRIST", "INDEX_FINGER_MCP", "MIDDLE_FINGER_MCP", "PINKY_MCP"]
+    for name in required:
+        if hand_points_camera.get(name) is None:
+            return {"valid": False, "reason": f"missing {name}"}
+
+    p_wrist = hand_points_camera["WRIST"]
+    p_index = hand_points_camera["INDEX_FINGER_MCP"]
+    p_middle = hand_points_camera["MIDDLE_FINGER_MCP"]
+    p_pinky = hand_points_camera["PINKY_MCP"]
+
+    x_palm = normalize_vec(p_index - p_pinky)
+    y_raw = normalize_vec(p_middle - p_wrist)
+    if x_palm is None or y_raw is None:
+        return {"valid": False, "reason": "degenerate palm vectors"}
+
+    z_palm = normalize_vec(np.cross(x_palm, y_raw))
+    if z_palm is None:
+        return {"valid": False, "reason": "degenerate palm normal"}
+
+    y_palm = normalize_vec(np.cross(z_palm, x_palm))
+    if y_palm is None:
+        return {"valid": False, "reason": "degenerate palm y axis"}
+
+    R_camera_palm = project_to_so3(np.column_stack([x_palm, y_palm, z_palm]))
+    if R_camera_palm is None:
+        return {"valid": False, "reason": "SO(3) projection failed"}
+
+    origin_points = [p for p in [p_wrist, p_index, p_middle, p_pinky] if p is not None]
+    p_ring = hand_points_camera.get("RING_FINGER_MCP")
+    if p_ring is not None:
+        origin_points.append(p_ring)
+    palm_origin = np.mean(np.stack(origin_points, axis=0), axis=0).astype(np.float32)
+
+    return {
+        "valid": True,
+        "R_camera_palm": R_camera_palm,
+        "palm_origin_camera": palm_origin,
+        "x_axis_camera": R_camera_palm[:, 0],
+        "y_axis_camera": R_camera_palm[:, 1],
+        "z_axis_camera": R_camera_palm[:, 2],
+        "reason": "ok",
+    }
+
+
+def matrix_to_quat_wxyz(R: np.ndarray) -> Optional[np.ndarray]:
+    R = project_to_so3(R)
+    if R is None:
+        return None
+    trace = float(np.trace(R))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    else:
+        i = int(np.argmax(np.diag(R)))
+        if i == 0:
+            s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif i == 1:
+            s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float32)
+    n = float(np.linalg.norm(q))
+    if n < 1e-8 or not np.isfinite(n):
+        return None
+    return q / n
+
+
+def quat_to_matrix_wxyz(q: np.ndarray) -> Optional[np.ndarray]:
+    q = np.asarray(q, dtype=np.float32)
+    n = float(np.linalg.norm(q))
+    if n < 1e-8 or not np.isfinite(n):
+        return None
+    w, x, y, z = q / n
+    R = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+    return project_to_so3(R)
+
+
+def quat_slerp(q0: np.ndarray, q1: np.ndarray, alpha: float) -> Optional[np.ndarray]:
+    q0 = np.asarray(q0, dtype=np.float32)
+    q1 = np.asarray(q1, dtype=np.float32)
+    q0 = q0 / max(float(np.linalg.norm(q0)), 1e-8)
+    q1 = q1 / max(float(np.linalg.norm(q1)), 1e-8)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    if dot > 0.9995:
+        q = q0 + alpha * (q1 - q0)
+        return q / max(float(np.linalg.norm(q)), 1e-8)
+    theta_0 = math.acos(np.clip(dot, -1.0, 1.0))
+    sin_theta_0 = math.sin(theta_0)
+    theta = theta_0 * alpha
+    s0 = math.cos(theta) - dot * math.sin(theta) / sin_theta_0
+    s1 = math.sin(theta) / sin_theta_0
+    q = s0 * q0 + s1 * q1
+    return q / max(float(np.linalg.norm(q)), 1e-8)
+
+
+def rotation_angle_deg(R_delta: np.ndarray) -> Optional[float]:
+    R_delta = project_to_so3(R_delta)
+    if R_delta is None:
+        return None
+    cos_angle = (float(np.trace(R_delta)) - 1.0) * 0.5
+    return float(math.degrees(math.acos(np.clip(cos_angle, -1.0, 1.0))))
+
+
+def empty_palm_state(reason: str = "hand unavailable") -> dict:
+    return {
+        "valid": False,
+        "reason": reason,
+        "handedness": "none",
+        "handedness_score": None,
+        "R_camera_palm": None,
+        "R_camera_palm_0": None,
+        "delta_R_camera_palm": None,
+        "q_camera_palm_wxyz": None,
+        "q_delta_palm_wxyz": None,
+        "palm_origin_camera_m": None,
+        "palm_normal_camera": None,
+        "angle_from_origin_deg": None,
+    }
+
+
+def update_palm_orientation_state(
+    palm_frame_camera: dict,
+    selected_hand,
+    runtime_state: dict,
+    auto_init: bool,
+    filter_alpha: float,
+    max_angle_step_deg: float,
+) -> dict:
+    label = "none"
+    score = None
+    if selected_hand is not None:
+        label = selected_hand.get("handedness_label", "Unknown")
+        score = selected_hand.get("handedness_score", None)
+
+    if palm_frame_camera is None or not palm_frame_camera.get("valid", False):
+        state = empty_palm_state(palm_frame_camera.get("reason", "palm invalid") if palm_frame_camera else "palm invalid")
+        state["handedness"] = label
+        state["handedness_score"] = score
+        return state
+
+    R_now = palm_frame_camera["R_camera_palm"]
+    R_filtered_prev = runtime_state.get("R_filtered")
+    if R_filtered_prev is not None:
+        step_angle = rotation_angle_deg(R_now @ R_filtered_prev.T)
+        if step_angle is not None and step_angle > max_angle_step_deg:
+            state = empty_palm_state(f"palm rotation jump {step_angle:.1f} deg")
+            state["handedness"] = label
+            state["handedness_score"] = score
+            return state
+        q_prev = matrix_to_quat_wxyz(R_filtered_prev)
+        q_now = matrix_to_quat_wxyz(R_now)
+        q_filtered = quat_slerp(q_prev, q_now, filter_alpha) if q_prev is not None and q_now is not None else None
+        R_use = quat_to_matrix_wxyz(q_filtered) if q_filtered is not None else R_now
+    else:
+        R_use = R_now
+
+    runtime_state["R_filtered"] = R_use.copy()
+    runtime_state["R_prev"] = R_now.copy()
+
+    if runtime_state.get("R0") is None and auto_init:
+        runtime_state["R0"] = R_use.copy()
+        print("[INFO] Auto set palm orientation origin.")
+
+    R0 = runtime_state.get("R0")
+    if R0 is None:
+        state = empty_palm_state("palm origin not initialized")
+        state["handedness"] = label
+        state["handedness_score"] = score
+        return state
+
+    delta_R = project_to_so3(R_use @ R0.T)
+    q_camera = matrix_to_quat_wxyz(R_use)
+    q_delta = matrix_to_quat_wxyz(delta_R) if delta_R is not None else None
+    angle = rotation_angle_deg(delta_R) if delta_R is not None else None
+
+    # q_delta_palm_wxyz 是视觉估计的手掌坐标系相对初始手掌坐标系的相对旋转，
+    # 不是 wrist joint angle，也不是 robot end-effector target rotation。
+    return {
+        "valid": delta_R is not None and q_camera is not None and q_delta is not None,
+        "reason": "ok",
+        "handedness": label,
+        "handedness_score": score,
+        "R_camera_palm": R_use,
+        "R_camera_palm_0": R0,
+        "delta_R_camera_palm": delta_R,
+        "q_camera_palm_wxyz": q_camera,
+        "q_delta_palm_wxyz": q_delta,
+        "palm_origin_camera_m": palm_frame_camera["palm_origin_camera"],
+        "palm_normal_camera": R_use[:, 2],
+        "angle_from_origin_deg": angle,
+    }
+
+
+def project_camera_point_to_pixel(P_camera, intrinsics) -> Optional[Tuple[int, int]]:
+    if P_camera is None or intrinsics is None:
+        return None
+    try:
+        X, Y, Z = [float(v) for v in P_camera]
+        fx = float(intrinsics["fx"])
+        fy = float(intrinsics["fy"])
+        cx = float(intrinsics["cx"])
+        cy = float(intrinsics["cy"])
+    except (TypeError, KeyError, ValueError):
+        return None
+    if Z <= 1e-6 or fx <= 0.0 or fy <= 0.0:
+        return None
+    u = int(round(fx * X / Z + cx))
+    v = int(round(fy * Y / Z + cy))
+    return u, v
+
+
+def draw_hand_landmarks_2d(
+    img,
+    hand_lms,
+    mirror: bool,
+    draw_names: bool = False,
+):
+    if hand_lms is None:
+        return
+    h, w = img.shape[:2]
+    for a, b in HAND_CONNECTIONS:
+        if a >= len(hand_lms) or b >= len(hand_lms):
+            continue
+        pa = lm_to_pixel(hand_lms[a], w, h, mirror=mirror)
+        pb = lm_to_pixel(hand_lms[b], w, h, mirror=mirror)
+        cv2.line(img, pa, pb, (255, 80, 220), 2, cv2.LINE_AA)
+
+    for lm in hand_lms:
+        p = lm_to_pixel(lm, w, h, mirror=mirror)
+        cv2.circle(img, p, 3, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(img, p, 5, (255, 80, 220), 1, cv2.LINE_AA)
+
+    if draw_names:
+        for name in ["WRIST", "INDEX_FINGER_MCP", "MIDDLE_FINGER_MCP", "PINKY_MCP"]:
+            idx = HAND_IDX[name]
+            if idx >= len(hand_lms):
+                continue
+            x, y = lm_to_pixel(hand_lms[idx], w, h, mirror=mirror)
+            short = name.replace("_FINGER", "").replace("_MCP", "").replace("WRIST", "PALM_WRI")
+            put_text(img, short, (x + 5, y - 5), scale=0.35, color=(255, 160, 255), bg=True)
+
+
+def draw_palm_frame_axes(
+    img,
+    palm_frame_camera,
+    intrinsics,
+    mirror: bool,
+    axis_length_m: float,
+):
+    if palm_frame_camera is None or not palm_frame_camera.get("valid", False) or intrinsics is None:
+        return
+    origin = palm_frame_camera.get("palm_origin_camera")
+    R = palm_frame_camera.get("R_camera_palm")
+    if origin is None or R is None:
+        return
+    h, w = img.shape[:2]
+
+    def project_for_display(point):
+        px = project_camera_point_to_pixel(point, intrinsics)
+        if px is None:
+            return None
+        x, y = px
+        if mirror:
+            x = w - 1 - x
+        if x < 0 or x >= w or y < 0 or y >= h:
+            return None
+        return int(x), int(y)
+
+    p0 = project_for_display(origin)
+    if p0 is None:
+        return
+
+    axes = [
+        (R[:, 0], (0, 0, 255), "x"),
+        (R[:, 1], (0, 255, 0), "y"),
+        (R[:, 2], (255, 0, 0), "z"),
+    ]
+    for axis, color, label in axes:
+        p1 = project_for_display(origin + axis_length_m * axis)
+        if p1 is None:
+            continue
+        cv2.line(img, p0, p1, color, 3, cv2.LINE_AA)
+        put_text(img, label, (p1[0] + 4, p1[1] + 4), scale=0.42, color=color, bg=True)
+
+
+def _array_to_list(value):
+    if value is None:
+        return None
+    return np.asarray(value, dtype=np.float32).tolist()
+
+
+def palm_state_udp_fields(palm_state: Optional[dict], frame_name: str) -> dict:
+    valid = bool(palm_state and palm_state.get("valid", False))
+    if not valid:
+        return {
+            "palm_orientation_valid": False,
+            "palm_frame": frame_name,
+            "palm_handedness": palm_state.get("handedness") if palm_state else "none",
+            "palm_handedness_score": palm_state.get("handedness_score") if palm_state else None,
+            "palm_reason": palm_state.get("reason") if palm_state else "palm invalid",
+            "R_camera_palm": None,
+            "delta_R_camera_palm": None,
+            "q_camera_palm_wxyz": None,
+            "q_delta_palm_wxyz": None,
+            "palm_origin_camera_m": None,
+            "palm_normal_camera": None,
+            "palm_angle_from_origin_deg": None,
+        }
+
+    return {
+        "palm_orientation_valid": True,
+        "palm_frame": frame_name,
+        "palm_handedness": palm_state.get("handedness"),
+        "palm_handedness_score": palm_state.get("handedness_score"),
+        "palm_reason": palm_state.get("reason"),
+        "R_camera_palm": _array_to_list(palm_state.get("R_camera_palm")),
+        "delta_R_camera_palm": _array_to_list(palm_state.get("delta_R_camera_palm")),
+        "q_camera_palm_wxyz": _array_to_list(palm_state.get("q_camera_palm_wxyz")),
+        "q_delta_palm_wxyz": _array_to_list(palm_state.get("q_delta_palm_wxyz")),
+        "palm_origin_camera_m": _array_to_list(palm_state.get("palm_origin_camera_m")),
+        "palm_normal_camera": _array_to_list(palm_state.get("palm_normal_camera")),
+        "palm_angle_from_origin_deg": palm_state.get("angle_from_origin_deg"),
+    }
+
+
+# ============================================================
 # UDP target publisher
 # ============================================================
 
@@ -888,6 +1474,7 @@ def make_wrist_udp_packet(
     origin_point: Optional[np.ndarray],
     publish_delta: bool,
     teleop_scale: float,
+    palm_state: Optional[dict] = None,
 ) -> dict:
     landmark_name = publish_target_to_landmark_name(publish_target)
     point = None
@@ -922,7 +1509,7 @@ def make_wrist_udp_packet(
         else:
             target_position_m = position_camera_m
 
-    return {
+    packet = {
         "stamp_ms": int(timestamp_ms),
         "frame_id": int(frame_id),
         "valid": bool(valid),
@@ -935,6 +1522,8 @@ def make_wrist_udp_packet(
         "teleop_scale": float(teleop_scale),
         "publish_delta": bool(publish_delta),
     }
+    packet.update(palm_state_udp_fields(palm_state, str(frame_name)))
+    return packet
 
 
 def lm_to_vec3(lms: List, index: int) -> np.ndarray:
@@ -1225,6 +1814,7 @@ def build_info_panel(
     lms: Optional[List],
     world_lms: Optional[List],
     rgbd_camera_points: Optional[Dict[str, Optional[np.ndarray]]],
+    palm_state: Optional[dict],
     intrinsics_available: bool,
     angles: Dict[str, Optional[float]],
     threshold: float,
@@ -1447,6 +2037,60 @@ def build_info_panel(
             put_text(panel, "shoulder-wrist RGB-D: --", (12, y), scale=0.38, color=(120, 120, 120), bg=False)
         y += 18
 
+    y += 16
+    put_text(panel, "Palm orientation / Hand Landmarker", (12, y), scale=0.53, color=(255, 120, 255), bg=False)
+    y += line_gap
+    palm_state = palm_state or empty_palm_state("hand disabled")
+    palm_valid = bool(palm_state.get("valid", False))
+    put_text(panel, f"Hand: {palm_state.get('handedness', 'none')}", (12, y), scale=0.43, color=(230, 230, 230), bg=False)
+    y += 18
+    score = palm_state.get("handedness_score")
+    put_text(panel, f"Hand score: {'--' if score is None else f'{score:.3f}'}", (12, y), scale=0.43, color=(230, 230, 230), bg=False)
+    y += 18
+    put_text(
+        panel,
+        f"Palm frame: {'valid' if palm_valid else 'invalid'} ({palm_state.get('reason', '--')})",
+        (12, y),
+        scale=0.40,
+        color=(0, 255, 0) if palm_valid else (80, 80, 255),
+        bg=False,
+    )
+    y += 20
+    normal = palm_state.get("palm_normal_camera")
+    if normal is not None:
+        put_text(panel, f"normal cam: {normal[0]:+.3f} {normal[1]:+.3f} {normal[2]:+.3f}", (12, y), scale=0.39, color=(230, 230, 230), bg=False)
+    else:
+        put_text(panel, "normal cam: --", (12, y), scale=0.39, color=(120, 120, 120), bg=False)
+    y += 18
+    angle = palm_state.get("angle_from_origin_deg")
+    put_text(panel, f"angle from origin: {'--' if angle is None else f'{angle:.1f} deg'}", (12, y), scale=0.39, color=(230, 230, 230), bg=False)
+    y += 18
+    q_delta = palm_state.get("q_delta_palm_wxyz")
+    if q_delta is not None:
+        put_text(panel, f"q_delta wxyz: {q_delta[0]:+.3f} {q_delta[1]:+.3f}", (12, y), scale=0.36, color=(230, 230, 230), bg=False)
+        y += 16
+        put_text(panel, f"              {q_delta[2]:+.3f} {q_delta[3]:+.3f}", (12, y), scale=0.36, color=(230, 230, 230), bg=False)
+    else:
+        put_text(panel, "q_delta wxyz: --", (12, y), scale=0.36, color=(120, 120, 120), bg=False)
+    y += 20
+    delta_R = palm_state.get("delta_R_camera_palm")
+    put_text(panel, "Delta R camera palm:", (12, y), scale=0.39, color=(255, 120, 255), bg=False)
+    y += 18
+    if delta_R is not None:
+        for row in np.asarray(delta_R):
+            put_text(panel, f"[{row[0]:+.2f} {row[1]:+.2f} {row[2]:+.2f}]", (18, y), scale=0.36, color=(230, 230, 230), bg=False)
+            y += 16
+    else:
+        put_text(panel, "--", (18, y), scale=0.36, color=(120, 120, 120), bg=False)
+        y += 16
+    y += 4
+    put_text(panel, "Palm orientation in camera frame,", (12, y), scale=0.34, color=(180, 180, 180), bg=False)
+    y += 15
+    put_text(panel, "not anatomical wrist joint rotation", (12, y), scale=0.34, color=(180, 180, 180), bg=False)
+    y += 15
+    put_text(panel, "camera/world/EE alignment is in UDP bridge", (12, y), scale=0.34, color=(180, 180, 180), bg=False)
+    y += 18
+
     return panel, y + 24
 
 
@@ -1548,6 +2192,8 @@ def main():
     mirror = not args.no_mirror
     draw_names = not args.no_draw_names
     segmentation = not args.no_segmentation
+    hand_enabled = args.enable_hand and not args.disable_hand
+    draw_hand = args.draw_hand and not args.no_draw_hand
     # 兼容 --model-complexity：保持旧命令习惯，同时内部仍使用 Tasks 的模型名。
     if args.model_complexity is not None:
         args.model = {0: "lite", 1: "full", 2: "heavy"}[args.model_complexity]
@@ -1560,10 +2206,23 @@ def main():
     )
 
     print("[INFO] Using model:", model_path)
+    hand_model_path = None
+    if hand_enabled:
+        try:
+            hand_model_path = ensure_hand_model(args.hand_model_path, args.hand_models_dir)
+            print("[INFO] Using hand model:", hand_model_path)
+        except Exception as exc:
+            print(f"[WARN] HandLandmarker model unavailable, disabling hand detection: {exc}")
+            hand_enabled = False
 
     BaseOptions = python.BaseOptions
     PoseLandmarker = vision.PoseLandmarker
     PoseLandmarkerOptions = vision.PoseLandmarkerOptions
+    HandLandmarker = getattr(vision, "HandLandmarker", None)
+    HandLandmarkerOptions = getattr(vision, "HandLandmarkerOptions", None)
+    if hand_enabled and (HandLandmarker is None or HandLandmarkerOptions is None):
+        print("[WARN] MediaPipe HandLandmarker API unavailable, disabling hand detection.")
+        hand_enabled = False
     VisionRunningMode = vision.RunningMode
 
     # PoseLandmarker 仍使用 VIDEO 模式：
@@ -1577,6 +2236,16 @@ def main():
         min_tracking_confidence=args.min_tracking_confidence,
         output_segmentation_masks=segmentation,
     )
+    hand_options = None
+    if hand_enabled:
+        hand_options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=hand_model_path),
+            running_mode=VisionRunningMode.VIDEO,
+            num_hands=args.num_hands,
+            min_hand_detection_confidence=args.min_hand_detection_confidence,
+            min_hand_presence_confidence=args.min_hand_presence_confidence,
+            min_tracking_confidence=args.min_hand_tracking_confidence,
+        )
 
     # 这里是 Orbbec 版本替代 webcam 版本的关键位置：
     # 不再创建 cv2.VideoCapture，而是创建 OrbbecCamera 包装器。
@@ -1613,14 +2282,18 @@ def main():
     last_frame_bgr = None
     last_depth_mm = None
     last_result = None
+    last_hand_result = None
+    palm_runtime = {"R0": None, "R_prev": None, "R_filtered": None}
+    latest_valid_palm_R = None
 
     print("[INFO] Started.")
     print(
         "[INFO] Keys: q/ESC quit, p pause/resume, w/s scroll panel, "
-        f"c screenshot, {args.reset_origin_key} reset UDP origin"
+        f"c screenshot, {args.reset_origin_key} reset UDP origin, "
+        f"{args.palm_reset_key} reset palm orientation origin"
     )
     print("[INFO] Mouse wheel or w/s: scroll right information panel")
-    print(f"[INFO] mirror={mirror}, segmentation={segmentation}, draw_names={draw_names}")
+    print(f"[INFO] mirror={mirror}, segmentation={segmentation}, draw_names={draw_names}, hand={hand_enabled}")
 
     window_name = "MediaPipe PoseLandmarker V2 Webcam Visualizer"
     panel_scroll = {"offset": 0, "max": 0}
@@ -1644,9 +2317,18 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(window_name, on_mouse)
 
-    # MediaPipe landmarker 生命周期由 context manager 管理；
-    # 相机 pipeline 生命周期由 OrbbecCamera.start()/stop() 管理。
-    with PoseLandmarker.create_from_options(options) as landmarker:
+    # MediaPipe landmarker 生命周期由 ExitStack 管理；
+    # HandLandmarker 初始化失败时不影响 PoseLandmarker / Orbbec / UDP 主流程。
+    with ExitStack() as stack:
+        landmarker = stack.enter_context(PoseLandmarker.create_from_options(options))
+        hand_landmarker = None
+        if hand_enabled:
+            try:
+                hand_landmarker = stack.enter_context(HandLandmarker.create_from_options(hand_options))
+            except Exception as exc:
+                print(f"[WARN] HandLandmarker initialization failed, disabling hand detection: {exc}")
+                hand_enabled = False
+
         while True:
             if not paused:
                 # Orbbec read() 返回：
@@ -1678,6 +2360,16 @@ def main():
 
                 result = landmarker.detect_for_video(mp_image, timestamp_ms)
                 last_result = result
+                hand_result = last_hand_result
+                if hand_enabled and hand_landmarker is not None:
+                    hand_every = max(1, int(args.hand_every_n_frames))
+                    if frame_id % hand_every == 0:
+                        try:
+                            hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+                            last_hand_result = hand_result
+                        except Exception as exc:
+                            print(f"[WARN] HandLandmarker detect failed: {exc}")
+                            hand_result = last_hand_result
 
                 # 平滑 FPS 显示，避免每帧瞬时 FPS 抖动太明显。
                 now_t = time.time()
@@ -1698,6 +2390,7 @@ def main():
                 frame_bgr = last_frame_bgr.copy()
                 depth_mm = last_depth_mm
                 result = last_result
+                hand_result = last_hand_result
                 timestamp_ms = int((time.monotonic() - start_monotonic) * 1000)
 
             vis_frame = frame_bgr.copy()
@@ -1709,6 +2402,27 @@ def main():
             intrinsics = camera.get_color_intrinsics()
             intrinsics_available = intrinsics is not None
             angles = {}
+            selected_hand = select_hand_result(hand_result, args.handedness) if hand_enabled else None
+            hand_lms = selected_hand["hand_lms"] if selected_hand is not None else None
+            hand_camera_points = compute_hand_camera_points(
+                hand_lms=hand_lms,
+                depth_mm=depth_mm,
+                intrinsics=intrinsics,
+                frame_w=frame_bgr.shape[1],
+                frame_h=frame_bgr.shape[0],
+                search_radius=args.palm_depth_radius,
+            ) if hand_lms is not None else {name: None for name in HAND_LANDMARK_NAMES}
+            palm_frame_camera = compute_palm_frame_from_points(hand_camera_points) if hand_lms is not None else {"valid": False, "reason": "no selected hand"}
+            palm_state = update_palm_orientation_state(
+                palm_frame_camera=palm_frame_camera,
+                selected_hand=selected_hand,
+                runtime_state=palm_runtime,
+                auto_init=args.palm_auto_init,
+                filter_alpha=args.palm_filter_alpha,
+                max_angle_step_deg=args.palm_max_angle_step_deg,
+            )
+            if palm_state.get("valid", False):
+                latest_valid_palm_R = palm_state["R_camera_palm"].copy()
 
             if result is not None and result.pose_landmarks:
                 # 当前脚本只取第一个人体姿态。
@@ -1750,6 +2464,21 @@ def main():
                     mirror=mirror,
                     visibility_threshold=args.visibility_threshold,
                 )
+                if draw_hand and hand_lms is not None:
+                    draw_hand_landmarks_2d(
+                        img=vis_frame,
+                        hand_lms=hand_lms,
+                        mirror=mirror,
+                        draw_names=draw_names,
+                    )
+                if args.draw_palm_frame:
+                    draw_palm_frame_axes(
+                        img=vis_frame,
+                        palm_frame_camera=palm_frame_camera,
+                        intrinsics=intrinsics,
+                        mirror=mirror,
+                        axis_length_m=args.palm_frame_axis_length,
+                    )
 
                 angles = calculate_angles(lms, args.visibility_threshold)
 
@@ -1770,6 +2499,21 @@ def main():
                     color=(0, 0, 255),
                     bg=True,
                 )
+                if draw_hand and hand_lms is not None:
+                    draw_hand_landmarks_2d(
+                        img=vis_frame,
+                        hand_lms=hand_lms,
+                        mirror=mirror,
+                        draw_names=draw_names,
+                    )
+                if args.draw_palm_frame:
+                    draw_palm_frame_axes(
+                        img=vis_frame,
+                        palm_frame_camera=palm_frame_camera,
+                        intrinsics=intrinsics,
+                        mirror=mirror,
+                        axis_length_m=args.palm_frame_axis_length,
+                    )
 
             if udp_pub is not None:
                 # UDP 发布的是 RGB-D camera coords：Orbbec aligned depth + color 像素反投影。
@@ -1794,6 +2538,7 @@ def main():
                     origin_point=wrist_origin,
                     publish_delta=args.publish_delta,
                     teleop_scale=args.teleop_scale,
+                    palm_state=palm_state,
                 )
                 udp_pub.publish(udp_packet)
                 udp_last_valid = bool(udp_packet.get("valid", False))
@@ -1836,6 +2581,7 @@ def main():
                 lms=lms,
                 world_lms=world_lms,
                 rgbd_camera_points=rgbd_camera_points,
+                palm_state=palm_state,
                 intrinsics_available=intrinsics_available,
                 angles=angles,
                 threshold=args.visibility_threshold,
@@ -1984,6 +2730,14 @@ def main():
                     if now_t - last_udp_warn_t > 0.5:
                         print(f"[WARN] Cannot reset wrist origin: {target_landmark_name} is invalid")
                         last_udp_warn_t = now_t
+
+            palm_reset_key = (args.palm_reset_key or "o").lower()[:1]
+            if palm_reset_key and key == ord(palm_reset_key):
+                if latest_valid_palm_R is not None:
+                    palm_runtime["R0"] = latest_valid_palm_R.copy()
+                    print("[INFO] Reset palm orientation origin.")
+                else:
+                    print("[WARN] Cannot reset palm orientation origin: no valid palm frame")
 
             # 截图保存的是最终合成窗口：左侧彩色姿态画面 + 右侧当前滚动位置的状态栏。
             if key == ord("c"):
