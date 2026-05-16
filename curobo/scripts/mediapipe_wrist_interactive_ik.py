@@ -130,7 +130,7 @@ def parse_args():
     parser.add_argument(
         "--use-cuda-graph",
         action="store_true",
-        default=False,
+        default=True,
         help="use the heavier interactive IK CUDA graph config from cuRobo examples",
     )
     return parser.parse_args()
