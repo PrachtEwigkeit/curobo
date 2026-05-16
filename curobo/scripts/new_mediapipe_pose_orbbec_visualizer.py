@@ -7,16 +7,16 @@ MediaPipe Right Arm / Right Hand Orbbec Teleop Publisher
 功能：
 1. 调用 Orbbec Python SDK 获取 RGB / aligned depth；
 2. 用 MediaPipe PoseLandmarker 获取右臂和双肩关键点；
-3. 用双肩中点定义 shoulder-centered local origin；
-4. 用 RGB-D 反投影得到 RIGHT_WRIST 相对 shoulder center 的位置和增量；
+3. 用 RGB-D 反投影得到 RIGHT_WRIST 在 Orbbec camera frame 下的位置；
+4. 用 RIGHT_WRIST camera position 定义位置原点和增量；
 5. 用 MediaPipe HandLandmarker 构造视觉 palm frame 和 delta_R_camera_palm；
 6. 可视化右臂、右手、palm frame；
-7. 通过 UDP 发布 right wrist shoulder-centered target 和 palm orientation。
+7. 通过 UDP 发布 right wrist camera-frame target 和 palm orientation。
 
 按键：
 q / ESC：退出
 p：暂停/继续
-r：重置 right wrist shoulder-centered position origin
+r：重置 right wrist camera position origin
 o：重置 palm orientation origin
 
 不再支持：
@@ -27,7 +27,7 @@ o：重置 palm orientation origin
 - MediaPipe pose_world_landmarks display。
 
 注意：
-- shoulder-centered camera coordinate 只改变原点，坐标轴仍与 Orbbec camera frame 平行；
+- right wrist position / delta 使用 Orbbec camera frame，不再使用 shoulder-centered origin；
 - 本脚本不做 camera->world 旋转，不做 palm->robot EE 对齐，不调用 cuRobo，不做 IK；
 - palm orientation 是视觉估计的 palm frame，不是严格解剖意义 wrist joint rotation。
 """
@@ -254,16 +254,15 @@ def parse_args():
     parser.add_argument("--palm-filter-alpha", type=float, default=0.25)
     parser.add_argument("--palm-max-angle-step-deg", type=float, default=60.0)
 
-    parser.add_argument("--udp-publish", action="store_true", default=False)
+    parser.add_argument("--udp-publish", action="store_true", default=True)
     parser.add_argument("--udp-host", type=str, default="127.0.0.1")
     parser.add_argument("--udp-port", type=int, default=5557)
     parser.add_argument("--udp-frame", type=str, default="orbbec_color_optical_frame")
-    parser.add_argument("--teleop-scale", type=float, default=1.0)
     parser.add_argument(
         "--publish-delta",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="publish teleop_scale * shoulder-centered wrist delta as target_position_m",
+        help="publish camera-frame wrist delta as target_position_m",
     )
     parser.add_argument("--reset-origin-key", type=str, default="r")
 
@@ -1311,49 +1310,77 @@ def make_wrist_udp_packet(
     frame_id: int,
     timestamp_ms: int,
     rgbd_camera_points: Dict[str, Optional[np.ndarray]],
-    rgbd_shoulder_points: Dict[str, Optional[np.ndarray]],
-    shoulder_center_camera: Optional[np.ndarray],
-    wrist_origin_shoulder: Optional[np.ndarray],
+    wrist_origin_camera: Optional[np.ndarray],
     frame_name: str,
     publish_delta: bool,
-    teleop_scale: float,
     palm_state: Optional[dict],
 ) -> dict:
     right_wrist_camera = rgbd_camera_points.get("RIGHT_WRIST")
-    right_wrist_shoulder = rgbd_shoulder_points.get("RIGHT_WRIST")
 
-    position_valid = right_wrist_camera is not None and shoulder_center_camera is not None and right_wrist_shoulder is not None
-    delta_shoulder = None
-    target_position_shoulder = None
-    if position_valid and wrist_origin_shoulder is not None:
-        delta_shoulder = right_wrist_shoulder - wrist_origin_shoulder
+    position_valid = right_wrist_camera is not None
+    delta_camera = None
+    target_position_camera = None
+    if position_valid and wrist_origin_camera is not None:
+        delta_camera = right_wrist_camera - wrist_origin_camera
 
     if position_valid:
         if publish_delta:
-            if delta_shoulder is not None:
-                target_position_shoulder = float(teleop_scale) * delta_shoulder
+            if delta_camera is not None:
+                target_position_camera = delta_camera
         else:
-            target_position_shoulder = right_wrist_shoulder
+            target_position_camera = right_wrist_camera
 
-    # target_position_m is intentionally shoulder-centered in this refactored script.
-    # It is kept only for bridge / downstream compatibility, and no longer means
-    # absolute camera optical-frame position.
+    #
+    # UDP 字段语义说明：
+    # - camera 坐标系：Orbbec aligned color/depth optical frame，原点在相机光心；
+    # - position_* 表示当前帧观测到的位置；
+    # - delta_* 表示当前帧位置相对按 r 键/自动初始化时记录的起始位置的增量；
+    # - target_* 表示推荐下游 bridge / IK viewer 使用的遥操作目标量。
     packet = {
+        # MediaPipe/Orbbec 处理后的本地时间戳，单位 ms。
+        # 该值来自主循环中的 timestamp_ms，用于下游判断数据新旧。
         "stamp_ms": int(timestamp_ms),
+
+        # 本脚本内部的彩色帧序号；每成功读取一帧 Orbbec 图像递增一次。
+        # 下游可用它判断 UDP packet 是否来自新图像帧。
         "frame_id": int(frame_id),
-        "valid": bool(position_valid and target_position_shoulder is not None),
+
+        # 位置目标是否可直接用于下游控制。
+        # 只有 RIGHT_WRIST camera 点有效，且 target_position_m 已经成功生成时才为 True。
+        "valid": bool(position_valid and target_position_camera is not None),
+
+        # 原始位置观测是否有效。
+        # 它只表示 RIGHT_WRIST 的 RGB-D camera 坐标是否可用，不要求 target_position_m 已生成。
         "valid_position": bool(position_valid),
+
+        # 当前 position_camera_m 所在的源坐标系名称。
+        # 默认来自 --udp-frame，通常是 orbbec_color_optical_frame。
         "source_frame": str(frame_name),
-        "origin_frame": "shoulder_center_camera_aligned",
+
+        # 下游推荐使用的位置原点语义。
+        # camera_optical_frame_delta 表示 delta / target 都直接以相机光心坐标系为参考。
+        "origin_frame": "camera_optical_frame_delta",
+
+        # 当前 packet 发布的主目标关键点名称。
+        # 这一版固定发布 MediaPipe PoseLandmarker 的 RIGHT_WRIST。
         "landmark_name": "RIGHT_WRIST",
+
+        # RIGHT_WRIST 在 Orbbec camera optical frame 下的绝对 3D 坐标，单位 meter。
+        # 生成方式：MediaPipe 2D RIGHT_WRIST 像素 + aligned depth + 相机内参反投影。
         "position_camera_m": arr_to_list(right_wrist_camera),
-        "shoulder_center_camera_m": arr_to_list(shoulder_center_camera),
-        "position_shoulder_m": arr_to_list(right_wrist_shoulder),
-        "delta_shoulder_m": arr_to_list(delta_shoulder),
-        "target_position_shoulder_m": arr_to_list(target_position_shoulder),
-        "delta_camera_m": arr_to_list(delta_shoulder),
-        "target_position_m": arr_to_list(target_position_shoulder),
-        "teleop_scale": float(teleop_scale),
+
+        # RIGHT_WRIST camera 位置相对初始 RIGHT_WRIST camera 位置的增量，单位 meter。
+        # 生成方式：position_camera_m - wrist_origin_camera。
+        # wrist_origin_camera 会在首次有效检测时自动设置，也可以按 r 键重置。
+        "delta_camera_m": arr_to_list(delta_camera),
+
+        # 推荐下游 bridge / IK viewer 使用的位置目标。
+        # 当 publish_delta=True：target = delta_camera_m；
+        # 当 publish_delta=False：target = position_camera_m。
+        "target_position_m": arr_to_list(target_position_camera),
+
+        # 标记 target_position_m 的生成模式。
+        # True 表示发布的是 camera delta；False 表示发布的是当前 camera 绝对位置。
         "publish_delta": bool(publish_delta),
     }
     packet.update(palm_state_udp_fields(palm_state, str(frame_name)))
@@ -1380,10 +1407,8 @@ def build_info_panel(
     intrinsics_available: bool,
     udp_enabled: bool,
     udp_port: int,
-    shoulder_center_camera,
     right_wrist_camera,
-    right_wrist_shoulder,
-    delta_shoulder,
+    delta_camera,
     target_position,
     palm_state: dict,
     paused: bool,
@@ -1408,7 +1433,7 @@ def build_info_panel(
     line(f"{'PAUSED' if paused else 'RUNNING'} | FPS {fps:.1f}", gap=18)
     line(f"Pose: {'yes' if pose_detected else 'no'} | Right hand: {'yes' if hand_detected else 'no'}", gap=18)
     line(f"RGB-D: {'yes' if intrinsics_available else 'no'} | UDP: {'on' if udp_enabled else 'off'} {udp_port if udp_enabled else '--'}", gap=18)
-    line("Origin: shoulder_center camera-aligned", color=(180, 220, 220), scale=0.36, gap=20)
+    line("Origin: camera optical frame", color=(180, 220, 220), scale=0.36, gap=20)
 
     if show_skeleton_panel:
         canvas_w = max(120, panel_w - 24)
@@ -1429,10 +1454,8 @@ def build_info_panel(
 
     put_text(panel, "Position", (12, y), scale=0.54, color=(0, 255, 0), bg=False)
     y += 25
-    line(f"Shoulder center cam: {fmt_vec(shoulder_center_camera)}", scale=0.38)
     line(f"R wrist camera     : {fmt_vec(right_wrist_camera)}", scale=0.38)
-    line(f"R wrist shoulder   : {fmt_vec(right_wrist_shoulder)}", scale=0.38)
-    line(f"Delta shoulder     : {fmt_vec(delta_shoulder)}", scale=0.38)
+    line(f"Delta camera       : {fmt_vec(delta_camera)}", scale=0.38)
     line(f"target_position_m  : {fmt_vec(target_position)}", scale=0.38, gap=24)
 
     put_text(panel, "Palm", (12, y), scale=0.54, color=(255, 120, 255), bg=False)
@@ -1541,7 +1564,7 @@ def main():
     last_pose_result = None
     last_hand_result = None
     last_non_right_hand_warn_t = 0.0
-    wrist_origin_shoulder = None
+    wrist_origin_camera = None
     palm_runtime = {"R0": None, "R_prev": None, "R_filtered": None}
     latest_valid_palm_R = None
 
@@ -1550,7 +1573,7 @@ def main():
 
     print("[INFO] Started.")
     print(f"[INFO] Keys: q/ESC quit, p pause/resume, {args.reset_origin_key} reset wrist origin, {args.palm_reset_key} reset palm origin")
-    print(f"[INFO] mirror={mirror}, hand={hand_enabled}, origin=shoulder_center")
+    print(f"[INFO] mirror={mirror}, hand={hand_enabled}, origin=camera")
 
     try:
         with ExitStack() as stack:
@@ -1650,10 +1673,7 @@ def main():
                     frame_h=frame_bgr.shape[0],
                     visibility_threshold=args.visibility_threshold,
                 )
-                shoulder_center_camera = compute_shoulder_center_camera(rgbd_camera_points)
-                rgbd_shoulder_points = compute_shoulder_centered_points(rgbd_camera_points, shoulder_center_camera)
                 right_wrist_camera = rgbd_camera_points.get("RIGHT_WRIST")
-                right_wrist_shoulder = rgbd_shoulder_points.get("RIGHT_WRIST")
 
                 hand_camera_points = compute_hand_camera_points(
                     hand_lms=hand_lms,
@@ -1675,30 +1695,27 @@ def main():
                 if palm_state.get("valid", False):
                     latest_valid_palm_R = palm_state["R_camera_palm"].copy()
 
-                if right_wrist_shoulder is not None and wrist_origin_shoulder is None:
-                    wrist_origin_shoulder = right_wrist_shoulder.copy()
-                    print("[INFO] Auto set wrist shoulder-centered origin:", wrist_origin_shoulder.tolist())
+                if right_wrist_camera is not None and wrist_origin_camera is None:
+                    wrist_origin_camera = right_wrist_camera.copy()
+                    print("[INFO] Auto set wrist camera origin:", wrist_origin_camera.tolist())
 
-                delta_shoulder = None if right_wrist_shoulder is None or wrist_origin_shoulder is None else right_wrist_shoulder - wrist_origin_shoulder
+                delta_camera = None if right_wrist_camera is None or wrist_origin_camera is None else right_wrist_camera - wrist_origin_camera
                 target_position = None
-                if right_wrist_shoulder is not None:
+                if right_wrist_camera is not None:
                     if args.publish_delta:
-                        if delta_shoulder is not None:
-                            target_position = float(args.teleop_scale) * delta_shoulder
+                        if delta_camera is not None:
+                            target_position = delta_camera
                     else:
-                        target_position = right_wrist_shoulder
+                        target_position = right_wrist_camera
 
                 if udp_pub is not None:
                     packet = make_wrist_udp_packet(
                         frame_id=frame_id,
                         timestamp_ms=timestamp_ms,
                         rgbd_camera_points=rgbd_camera_points,
-                        rgbd_shoulder_points=rgbd_shoulder_points,
-                        shoulder_center_camera=shoulder_center_camera,
-                        wrist_origin_shoulder=wrist_origin_shoulder,
+                        wrist_origin_camera=wrist_origin_camera,
                         frame_name=args.udp_frame,
                         publish_delta=args.publish_delta,
-                        teleop_scale=args.teleop_scale,
                         palm_state=palm_state,
                     )
                     udp_pub.publish(packet)
@@ -1718,7 +1735,7 @@ def main():
                 status = "PAUSED" if paused else "RUNNING"
                 put_text(
                     vis_frame,
-                    f"{status} | FPS {fps_smooth:.1f} | pose={pose_detected} | right_hand={hand_detected} | UDP={udp_pub is not None} | origin=shoulder_center",
+                    f"{status} | FPS {fps_smooth:.1f} | pose={pose_detected} | right_hand={hand_detected} | UDP={udp_pub is not None} | origin=camera",
                     (16, 32),
                     scale=0.55,
                     color=(0, 255, 255),
@@ -1736,10 +1753,8 @@ def main():
                     intrinsics_available=intrinsics_available,
                     udp_enabled=udp_pub is not None,
                     udp_port=args.udp_port,
-                    shoulder_center_camera=shoulder_center_camera,
                     right_wrist_camera=right_wrist_camera,
-                    right_wrist_shoulder=right_wrist_shoulder,
-                    delta_shoulder=delta_shoulder,
+                    delta_camera=delta_camera,
                     target_position=target_position,
                     palm_state=palm_state,
                     paused=paused,
@@ -1773,11 +1788,11 @@ def main():
 
                 reset_key = (args.reset_origin_key or "r").lower()[:1]
                 if reset_key and key == ord(reset_key):
-                    if right_wrist_shoulder is not None:
-                        wrist_origin_shoulder = right_wrist_shoulder.copy()
-                        print("[INFO] Reset wrist shoulder-centered origin:", wrist_origin_shoulder.tolist())
+                    if right_wrist_camera is not None:
+                        wrist_origin_camera = right_wrist_camera.copy()
+                        print("[INFO] Reset wrist camera origin:", wrist_origin_camera.tolist())
                     else:
-                        print("[WARN] Cannot reset wrist origin: right wrist shoulder-centered point invalid")
+                        print("[WARN] Cannot reset wrist origin: right wrist camera point invalid")
 
                 palm_reset_key = (args.palm_reset_key or "o").lower()[:1]
                 if palm_reset_key and key == ord(palm_reset_key):

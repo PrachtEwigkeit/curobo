@@ -2,33 +2,54 @@
 # -*- coding: utf-8 -*-
 
 """
-UDP bridge from camera-frame wrist targets to world-frame wrist targets.
+Teleop UDP protocol adapter from camera-frame targets to world-frame targets.
 
-This script is not an IK solver. It does not open a camera, run MediaPipe, or
-import cuRobo. Its only job is:
+This bridge sits between:
 
-    camera-frame UDP target
-        -> fixed extrinsic transform
-        -> world-frame UDP target
+    MediaPipe Right Arm / Right Hand Orbbec Teleop Publisher
+        -> camera-frame UDP packet on 127.0.0.1:5557
+        -> this bridge
+        -> world-frame UDP packet on 127.0.0.1:5558
+        -> cuRobo interactive IK viewer
+
+This script is not an IK solver. It does not open an Orbbec camera, does not run
+MediaPipe, does not import OpenCV, and does not import cuRobo. It only adapts the
+teleoperation UDP protocol.
 
 Coordinate notes:
-- camera coords are assumed to originate at the Orbbec optical center;
-- world coords originate at t_world_camera, provided by the user;
-- delta vectors are affected only by rotation, not translation;
-- absolute positions use rotation plus translation;
-- the default rotation assumes camera Z is horizontal/forward, and maps the
-  camera axes to world as X_world=Z_camera, Y_world=-X_camera, Z_world=-Y_camera.
+- camera coords originate at the Orbbec optical center;
+- absolute camera points use p_world = R_world_camera @ p_camera + t_world_camera;
+- vectors such as delta_camera_m only use rotation;
+- palm orientation is converted from camera frame to world frame;
+- palm frame is a visual hand-palm frame, not a robot end-effector frame.
+
+Default R_world_camera:
+
+    X_world =  Z_camera
+    Y_world = -X_camera
+    Z_world = -Y_camera
+
+Recommended no-double-scale setup:
+
+    python camera_to_world_udp_bridge.py --output-mode curobo_delta --no-apply-bridge-scale
+    python curobo_udp_viewer.py --target-source udp --udp-port 5558 --mapping-mode delta --teleop-scale 0.5
+
+In that setup, this bridge outputs raw human delta in world axes, while the cuRobo
+viewer owns human_origin, robot_ee_origin, viewer teleop_scale, filtering, clamp,
+and IK. If a future calibration provides R_palm_ee, robot EE orientation can be
+computed downstream as R_world_ee = R_world_palm @ R_palm_ee.
 """
 
 import argparse
 import json
 import socket
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
 
+BRIDGE_VERSION = "teleop_protocol_adapter_v2"
 DEFAULT_ROTATION_PRESET = "camera_z_forward_y_down_to_world_x_forward_z_up"
 
 DEFAULT_R_WORLD_CAMERA = np.array(
@@ -40,9 +61,21 @@ DEFAULT_R_WORLD_CAMERA = np.array(
     dtype=np.float32,
 )
 
+# R_palm_ee expresses the robot EE frame axes in the visual palm frame.
+# The bridge computes R_world_ee_target = R_world_palm @ R_palm_ee.
+# If your convention is the opposite, edit this matrix to its transpose.
+DEFAULT_R_PALM_EE = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float32,
+)
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="UDP camera-frame to world-frame target bridge")
+    parser = argparse.ArgumentParser(description="Teleop UDP camera/world protocol adapter")
     parser.add_argument("--input-host", type=str, default="127.0.0.1")
     parser.add_argument("--input-port", type=int, default=5557)
     parser.add_argument("--output-host", type=str, default="127.0.0.1")
@@ -58,7 +91,7 @@ def parse_args():
         "--rotation-matrix",
         type=str,
         default="",
-        help='nine comma-separated row-major numbers, e.g. "0,0,1,1,0,0,0,-1,0"',
+        help='nine row-major comma-separated numbers, e.g. "0,0,1,-1,0,0,0,-1,0"',
     )
     parser.add_argument(
         "--translation",
@@ -66,10 +99,43 @@ def parse_args():
         default="0,0,0",
         help='three comma-separated numbers for t_world_camera, e.g. "0.2,0,0.5"',
     )
-    parser.add_argument("--target-mode", choices=["delta", "absolute"], default="delta")
-    parser.add_argument("--teleop-scale", type=float, default=None)
+    parser.add_argument(
+        "--output-mode",
+        choices=["curobo_delta", "absolute_passthrough"],
+        default="curobo_delta",
+        help="curobo_delta publishes world human delta; absolute_passthrough is for debugging",
+    )
+    parser.add_argument(
+        "--apply-bridge-scale",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="apply --bridge-scale inside this bridge; off by default to avoid double scaling",
+    )
+    parser.add_argument("--bridge-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--validate-rotation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="validate R_world_camera at startup",
+    )
+    # Deprecated compatibility options from the first bridge version. They are
+    # accepted so old shell commands do not fail, but the v2 protocol is driven
+    # by --output-mode and --bridge-scale.
+    parser.add_argument("--target-mode", choices=["delta", "absolute"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--teleop-scale", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--verbose", action="store_true", default=False)
     return parser.parse_args()
+
+
+def normalize_legacy_args(args):
+    if args.target_mode is not None:
+        args.output_mode = "curobo_delta" if args.target_mode == "delta" else "absolute_passthrough"
+        print(f"[WARN] --target-mode is deprecated; using --output-mode {args.output_mode}")
+
+    if args.teleop_scale is not None:
+        args.bridge_scale = float(args.teleop_scale)
+        args.apply_bridge_scale = True
+        print("[WARN] --teleop-scale is deprecated; using it as --bridge-scale with --apply-bridge-scale")
 
 
 def parse_float_list(text: str, expected_len: int, name: str) -> np.ndarray:
@@ -93,6 +159,125 @@ def load_rotation(args) -> np.ndarray:
     return DEFAULT_R_WORLD_CAMERA.copy()
 
 
+def load_palm_to_ee_rotation() -> np.ndarray:
+    R_palm_ee = DEFAULT_R_PALM_EE.copy()
+    ok, msg = validate_rotation_matrix(R_palm_ee)
+    if not ok:
+        raise SystemExit(f"[ERROR] Invalid R_palm_ee: {msg}")
+    return R_palm_ee.astype(np.float32)
+
+
+# ============================================================
+# SO(3) / Quaternion
+# ============================================================
+
+def project_to_so3(R: np.ndarray) -> Optional[np.ndarray]:
+    if R is None:
+        return None
+    R = np.asarray(R, dtype=np.float32)
+    if R.shape != (3, 3) or not np.all(np.isfinite(R)):
+        return None
+
+    try:
+        U, _S, Vt = np.linalg.svd(R)
+    except np.linalg.LinAlgError:
+        return None
+
+    R_proj = U @ Vt
+    if np.linalg.det(R_proj) < 0.0:
+        U[:, -1] *= -1.0
+        R_proj = U @ Vt
+    return R_proj.astype(np.float32)
+
+
+def validate_rotation_matrix(R: np.ndarray, atol: float = 1e-3) -> Tuple[bool, str]:
+    if R is None:
+        return False, "rotation is None"
+    R = np.asarray(R, dtype=np.float32)
+    if R.shape != (3, 3):
+        return False, f"rotation shape is {R.shape}, expected (3, 3)"
+    if not np.all(np.isfinite(R)):
+        return False, "rotation contains non-finite values"
+
+    orth_err = float(np.linalg.norm(R.T @ R - np.eye(3, dtype=np.float32)))
+    det = float(np.linalg.det(R))
+    if orth_err > atol:
+        return False, f"R.T @ R is not close to I, error={orth_err:.6f}"
+    if abs(det - 1.0) > atol:
+        return False, f"det(R) is not close to +1, det={det:.6f}"
+    return True, "ok"
+
+
+def matrix_to_quat_wxyz(R: np.ndarray) -> Optional[np.ndarray]:
+    R = project_to_so3(R)
+    if R is None:
+        return None
+
+    trace = float(np.trace(R))
+    if trace > 0.0:
+        s = float(np.sqrt(trace + 1.0)) * 2.0
+        w = 0.25 * s
+        x = (float(R[2, 1]) - float(R[1, 2])) / s
+        y = (float(R[0, 2]) - float(R[2, 0])) / s
+        z = (float(R[1, 0]) - float(R[0, 1])) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = float(np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])) * 2.0
+        w = (float(R[2, 1]) - float(R[1, 2])) / s
+        x = 0.25 * s
+        y = (float(R[0, 1]) + float(R[1, 0])) / s
+        z = (float(R[0, 2]) + float(R[2, 0])) / s
+    elif R[1, 1] > R[2, 2]:
+        s = float(np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])) * 2.0
+        w = (float(R[0, 2]) - float(R[2, 0])) / s
+        x = (float(R[0, 1]) + float(R[1, 0])) / s
+        y = 0.25 * s
+        z = (float(R[1, 2]) + float(R[2, 1])) / s
+    else:
+        s = float(np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])) * 2.0
+        w = (float(R[1, 0]) - float(R[0, 1])) / s
+        x = (float(R[0, 2]) + float(R[2, 0])) / s
+        y = (float(R[1, 2]) + float(R[2, 1])) / s
+        z = 0.25 * s
+
+    q = np.asarray([w, x, y, z], dtype=np.float32)
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-8 or not np.isfinite(norm):
+        return None
+    return q / norm
+
+
+def quat_to_matrix_wxyz(q) -> Optional[np.ndarray]:
+    if q is None:
+        return None
+    try:
+        q = np.asarray(q, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if q.shape != (4,) or not np.all(np.isfinite(q)):
+        return None
+
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-8:
+        return None
+    w, x, y, z = q / norm
+
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def parse_rotation_field(value) -> Optional[np.ndarray]:
+    R = parse_mat3(value)
+    if R is None:
+        return None
+    return project_to_so3(R)
+
+
 def parse_vec3(value) -> Optional[np.ndarray]:
     if value is None:
         return None
@@ -102,6 +287,25 @@ def parse_vec3(value) -> Optional[np.ndarray]:
         arr = np.asarray(value, dtype=np.float32)
     except (TypeError, ValueError):
         return None
+    if arr.shape != (3,) or not np.all(np.isfinite(arr)):
+        return None
+    return arr
+
+
+def parse_mat3(value) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+
+    try:
+        arr = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+
+    if arr.shape == (9,):
+        arr = arr.reshape(3, 3)
+    elif arr.shape != (3, 3):
+        return None
+
     if not np.all(np.isfinite(arr)):
         return None
     return arr
@@ -110,72 +314,217 @@ def parse_vec3(value) -> Optional[np.ndarray]:
 def vec_to_list(value: Optional[np.ndarray]):
     if value is None:
         return None
-    return [float(value[0]), float(value[1]), float(value[2])]
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    return [float(x) for x in arr]
 
 
-def read_scale(packet: dict, override_scale: Optional[float]) -> float:
-    if override_scale is not None:
-        return float(override_scale)
-    try:
-        return float(packet.get("teleop_scale", 1.0))
-    except (TypeError, ValueError):
-        return 1.0
+def mat_to_list(value: Optional[np.ndarray]):
+    if value is None:
+        return None
+    return np.asarray(value, dtype=np.float32).astype(float).tolist()
 
 
-def make_world_packet(packet: dict, R: np.ndarray, t: np.ndarray, args) -> dict:
-    valid = bool(packet.get("valid", False))
-
+def transform_position_fields(packet: dict, R: np.ndarray, t: np.ndarray):
     position_camera = parse_vec3(packet.get("position_camera_m"))
     delta_camera = parse_vec3(packet.get("delta_camera_m"))
     target_camera = parse_vec3(packet.get("target_position_m"))
 
     position_world = None if position_camera is None else R @ position_camera + t
     delta_world = None if delta_camera is None else R @ delta_camera
+    target_world_vector = None if target_camera is None else R @ target_camera
 
-    scale = read_scale(packet, args.teleop_scale)
-    target_position_world = None
+    return {
+        "position_camera": position_camera,
+        "delta_camera": delta_camera,
+        "target_camera": target_camera,
+        "position_world": position_world,
+        "delta_world": delta_world,
+        "target_world_vector": target_world_vector,
+    }
 
-    if valid:
-        if args.target_mode == "delta":
-            if delta_world is not None:
-                target_position_world = scale * delta_world
-            elif target_camera is not None:
-                # Fallback: the upstream packet may only provide target_position_m.
-                # In that case rotate it as the target vector without applying an
-                # extra scale, because it may already be a scaled delta.
-                target_position_world = R @ target_camera
-        else:
-            absolute_camera = target_camera if target_camera is not None else position_camera
-            if absolute_camera is not None:
-                target_position_world = R @ absolute_camera + t
+
+def make_target_position(packet: dict, fields: dict, R: np.ndarray, t: np.ndarray, args):
+    if args.output_mode == "curobo_delta":
+        target = fields["delta_world"]
+        if target is None:
+            target = fields["target_world_vector"]
+        if target is not None and args.apply_bridge_scale:
+            target = float(args.bridge_scale) * target
+        semantics = (
+            "bridge_scaled_human_delta_world_m"
+            if args.apply_bridge_scale
+            else "raw_human_delta_world_m_unscaled"
+        )
+        return target, semantics
+
+    target_camera = fields["target_camera"]
+    if bool(packet.get("publish_delta", False)):
+        target = None if target_camera is None else R @ target_camera
+        return target, "camera_delta_vector_transformed_to_world"
+
+    if target_camera is None:
+        target_camera = fields["position_camera"]
+    target = None if target_camera is None else R @ target_camera + t
+    return target, "absolute_camera_point_transformed_to_world"
+
+
+def transform_palm_orientation(
+    packet: dict,
+    R_world_camera: np.ndarray,
+    t_world_camera: np.ndarray,
+    R_palm_ee: np.ndarray,
+):
+    upstream_valid = bool(packet.get("palm_orientation_valid", False))
+
+    R_camera_palm = parse_rotation_field(packet.get("R_camera_palm"))
+    R_camera_palm_0 = parse_rotation_field(packet.get("R_camera_palm_0"))
+    delta_R_camera_palm = parse_rotation_field(packet.get("delta_R_camera_palm"))
+    palm_origin_camera = parse_vec3(packet.get("palm_origin_camera_m"))
+    palm_normal_camera = parse_vec3(packet.get("palm_normal_camera"))
+
+    R_world_palm = None if R_camera_palm is None else project_to_so3(R_world_camera @ R_camera_palm)
+    R_world_palm_0 = None if R_camera_palm_0 is None else project_to_so3(R_world_camera @ R_camera_palm_0)
+
+    delta_R_world_palm = None
+    if R_world_palm is not None and R_world_palm_0 is not None:
+        delta_R_world_palm = project_to_so3(R_world_palm @ R_world_palm_0.T)
+    elif delta_R_camera_palm is not None:
+        delta_R_world_palm = project_to_so3(R_world_camera @ delta_R_camera_palm @ R_world_camera.T)
+
+    q_world_palm = matrix_to_quat_wxyz(R_world_palm) if R_world_palm is not None else None
+    q_delta_world_palm = matrix_to_quat_wxyz(delta_R_world_palm) if delta_R_world_palm is not None else None
+    palm_origin_world = None if palm_origin_camera is None else R_world_camera @ palm_origin_camera + t_world_camera
+    palm_normal_world = None if palm_normal_camera is None else R_world_camera @ palm_normal_camera
+
+    valid_orientation = bool(
+        upstream_valid
+        and R_world_palm is not None
+        and delta_R_world_palm is not None
+        and q_world_palm is not None
+        and q_delta_world_palm is not None
+    )
+
+    if not upstream_valid:
+        reason = packet.get("palm_reason", "palm orientation invalid upstream")
+    elif not valid_orientation:
+        reason = "palm orientation matrix parse/transform failed"
+    else:
+        reason = packet.get("palm_reason", "ok")
+
+    R_world_ee_target = None
+    R_world_ee_target_0 = None
+    delta_R_world_ee_target = None
+    q_world_ee_target = None
+    q_delta_world_ee_target = None
+
+    if R_world_palm is not None:
+        R_world_ee_target = project_to_so3(R_world_palm @ R_palm_ee)
+
+    if R_world_palm_0 is not None:
+        R_world_ee_target_0 = project_to_so3(R_world_palm_0 @ R_palm_ee)
+
+    if R_world_ee_target is not None and R_world_ee_target_0 is not None:
+        delta_R_world_ee_target = project_to_so3(R_world_ee_target @ R_world_ee_target_0.T)
+    elif delta_R_world_palm is not None:
+        # With a fixed right-multiplied R_palm_ee, relative rotation is
+        # equivalent to palm delta. Keep this fallback so downstream can still
+        # receive a delta orientation when only delta_R_camera_palm is available.
+        delta_R_world_ee_target = delta_R_world_palm
+
+    if R_world_ee_target is not None:
+        q_world_ee_target = matrix_to_quat_wxyz(R_world_ee_target)
+
+    if delta_R_world_ee_target is not None:
+        q_delta_world_ee_target = matrix_to_quat_wxyz(delta_R_world_ee_target)
+
+    ee_orientation_valid = bool(
+        valid_orientation
+        and R_world_ee_target is not None
+        and q_world_ee_target is not None
+    )
+
+    return {
+        "valid_orientation": valid_orientation,
+        "palm_orientation_valid": valid_orientation,
+        "palm_reason": reason,
+        "R_world_palm": mat_to_list(R_world_palm) if valid_orientation else None,
+        "R_world_palm_0": mat_to_list(R_world_palm_0) if valid_orientation else None,
+        "delta_R_world_palm": mat_to_list(delta_R_world_palm) if valid_orientation else None,
+        "q_world_palm_wxyz": vec_to_list(q_world_palm) if valid_orientation else None,
+        "q_delta_world_palm_wxyz": vec_to_list(q_delta_world_palm) if valid_orientation else None,
+        "palm_origin_world_m": vec_to_list(palm_origin_world) if valid_orientation else None,
+        "palm_normal_world": vec_to_list(palm_normal_world) if valid_orientation else None,
+        "palm_orientation_frame": "world",
+        "palm_orientation_semantics": "visual_palm_frame_not_robot_ee_frame",
+        "ee_orientation_valid": ee_orientation_valid,
+        "R_palm_ee": mat_to_list(R_palm_ee),
+        "R_world_ee_target": mat_to_list(R_world_ee_target) if ee_orientation_valid else None,
+        "R_world_ee_target_0": mat_to_list(R_world_ee_target_0) if ee_orientation_valid else None,
+        "delta_R_world_ee_target": mat_to_list(delta_R_world_ee_target) if ee_orientation_valid else None,
+        "q_world_ee_target_wxyz": vec_to_list(q_world_ee_target) if ee_orientation_valid else None,
+        "q_delta_world_ee_target_wxyz": vec_to_list(q_delta_world_ee_target) if ee_orientation_valid else None,
+        "ee_orientation_frame": "world",
+        "ee_orientation_semantics": "robot_end_effector_target_from_visual_palm_frame",
+    }
+
+
+def make_world_packet(packet: dict, R: np.ndarray, t: np.ndarray, args) -> dict:
+    fields = transform_position_fields(packet, R, t)
+    target_position_world, target_semantics = make_target_position(packet, fields, R, t, args)
+
+    upstream_position_valid = bool(packet.get("valid_position", packet.get("valid", False)))
+    if args.output_mode == "curobo_delta":
+        valid_position = bool(
+            upstream_position_valid
+            and (fields["delta_world"] is not None or fields["target_world_vector"] is not None)
+        )
+    else:
+        valid_position = bool(upstream_position_valid and target_position_world is not None)
+
+    palm_fields = transform_palm_orientation(packet, R, t, args.R_palm_ee)
 
     output = dict(packet)
     output.update(
         {
-            "valid": valid,
+            "valid": valid_position,
+            "valid_position": valid_position,
+            "valid_orientation": palm_fields["valid_orientation"],
             "target_frame": "world",
-            "position_camera_m": vec_to_list(position_camera),
-            "delta_camera_m": vec_to_list(delta_camera),
-            "position_world_m": vec_to_list(position_world),
-            "delta_world_m": vec_to_list(delta_world),
+            "position_camera_m": vec_to_list(fields["position_camera"]),
+            "delta_camera_m": vec_to_list(fields["delta_camera"]),
+            "position_world_m": vec_to_list(fields["position_world"]),
+            "delta_world_m": vec_to_list(fields["delta_world"]),
             "target_position_world_m": vec_to_list(target_position_world),
-            # Compatibility field for older consumers. In bridge output this is
-            # now in world frame, not camera frame.
+            # Compatibility for older cuRobo receiver code. In bridge v2 output
+            # this field is already in world frame and follows target semantics.
             "target_position_m": vec_to_list(target_position_world),
-            "rotation_world_camera": R.astype(float).tolist(),
+            "target_position_semantics": target_semantics,
+            "bridge_output_mode": args.output_mode,
+            "scale_applied_by_bridge": bool(args.apply_bridge_scale),
+            "bridge_scale": float(args.bridge_scale),
+            "rotation_world_camera": mat_to_list(R),
             "translation_world_camera_m": vec_to_list(t),
-            "target_mode": args.target_mode,
-            "teleop_scale": scale,
             "bridge_time_ms": int(time.time() * 1000),
+            "bridge_version": BRIDGE_VERSION,
         }
     )
+    output.update(palm_fields)
     return output
 
 
 def main():
     args = parse_args()
+    normalize_legacy_args(args)
+
     R = load_rotation(args)
     t = parse_float_list(args.translation, 3, "--translation")
+    R_palm_ee = load_palm_to_ee_rotation()
+    args.R_palm_ee = R_palm_ee
+
+    if args.validate_rotation:
+        ok, msg = validate_rotation_matrix(R)
+        if not ok:
+            raise SystemExit(f"[ERROR] Invalid R_world_camera: {msg}")
 
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     recv_sock.bind((args.input_host, args.input_port))
@@ -186,16 +535,22 @@ def main():
 
     received_count = 0
     published_count = 0
-    latest_valid = False
-    latest_target = None
+    latest_valid_position = False
+    latest_valid_orientation = False
+    latest_target_position_world = None
     next_status_t = time.time() + 1.0
 
-    print(f"[INFO] camera_to_world_udp_bridge input  {args.input_host}:{args.input_port}")
-    print(f"[INFO] camera_to_world_udp_bridge output {args.output_host}:{args.output_port}")
-    print(f"[INFO] target_mode={args.target_mode}, teleop_scale_override={args.teleop_scale}")
+    print(f"[INFO] camera_to_world_udp_bridge v2 input  {args.input_host}:{args.input_port}")
+    print(f"[INFO] camera_to_world_udp_bridge v2 output {args.output_host}:{args.output_port}")
+    print(
+        f"[INFO] output_mode={args.output_mode}, "
+        f"apply_bridge_scale={args.apply_bridge_scale}, bridge_scale={args.bridge_scale}"
+    )
     print("[INFO] R_world_camera =")
     print(R)
     print(f"[INFO] t_world_camera = {t.tolist()}")
+    print("[INFO] R_palm_ee =")
+    print(R_palm_ee)
     print("[INFO] Press Ctrl+C to exit.")
 
     try:
@@ -205,7 +560,9 @@ def main():
                 print(
                     "[STATUS] "
                     f"received={received_count} published={published_count} "
-                    f"latest_valid={latest_valid} latest_target_world={latest_target}"
+                    f"latest_valid_position={latest_valid_position} "
+                    f"latest_target_position_world_m={latest_target_position_world} "
+                    f"latest_valid_orientation={latest_valid_orientation}"
                 )
                 next_status_t = now_t + 1.0
 
@@ -220,11 +577,15 @@ def main():
                 print(f"[WARN] Invalid input JSON: {exc}")
                 continue
 
+            if not isinstance(packet, dict):
+                print("[WARN] Input JSON is not an object; skipping")
+                continue
+
             received_count += 1
             try:
                 output_packet = make_world_packet(packet, R, t, args)
             except Exception as exc:
-                print(f"[WARN] Failed to transform packet: {exc}")
+                print(f"[WARN] Failed to adapt packet: {exc}")
                 continue
 
             payload = json.dumps(output_packet, separators=(",", ":")).encode("utf-8")
@@ -235,8 +596,9 @@ def main():
                 continue
 
             published_count += 1
-            latest_valid = bool(output_packet.get("valid", False))
-            latest_target = output_packet.get("target_position_world_m")
+            latest_valid_position = bool(output_packet.get("valid_position", False))
+            latest_valid_orientation = bool(output_packet.get("valid_orientation", False))
+            latest_target_position_world = output_packet.get("target_position_world_m")
             if args.verbose:
                 print(json.dumps(output_packet, ensure_ascii=False, indent=2))
 

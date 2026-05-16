@@ -101,12 +101,18 @@ def parse_args():
     parser.add_argument("--target-timeout-s", type=float, default=0.3)
 
     parser.add_argument("--mapping-mode", choices=["identity", "delta", "manual"], default="delta")
-    parser.add_argument("--teleop-scale", type=float, default=0.5)
+    parser.add_argument("--teleop-scale", type=float, default=1)
     parser.add_argument(
         "--fixed-orientation",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="use the initial robot EE orientation as a fixed wxyz quaternion",
+    )
+    parser.add_argument(
+        "--use-udp-ee-orientation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use q_world_ee_target_wxyz from UDP packet and map it as relative EE orientation",
     )
 
     parser.add_argument("--manual-axis-map", nargs=3, default=["x", "y", "z"])
@@ -191,6 +197,90 @@ def filter_target(position: np.ndarray, previous: Optional[np.ndarray], args) ->
     return position.astype(np.float32)
 
 
+def parse_quat_wxyz(value):
+    if value is None:
+        return None
+    try:
+        q = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if q.shape != (4,) or not np.all(np.isfinite(q)):
+        return None
+    n = float(np.linalg.norm(q))
+    if n < 1e-8:
+        return None
+    return q / n
+
+
+def quat_to_matrix_wxyz(q):
+    q = parse_quat_wxyz(q)
+    if q is None:
+        return None
+    w, x, y, z = q
+    R = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+    return R
+
+
+def matrix_to_quat_wxyz(R):
+    if R is None:
+        return None
+    R = np.asarray(R, dtype=np.float32)
+    if R.shape != (3, 3) or not np.all(np.isfinite(R)):
+        return None
+
+    try:
+        U, _S, Vt = np.linalg.svd(R)
+        R = U @ Vt
+        if np.linalg.det(R) < 0.0:
+            U[:, -1] *= -1.0
+            R = U @ Vt
+    except Exception:
+        return None
+
+    trace = float(np.trace(R))
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+
+    return parse_quat_wxyz([w, x, y, z])
+
+
+def packet_ee_quat(packet):
+    if not packet:
+        return None
+    if not bool(packet.get("ee_orientation_valid", packet.get("valid_orientation", False))):
+        return None
+    return parse_quat_wxyz(packet.get("q_world_ee_target_wxyz"))
+
+
 def make_pose(position: np.ndarray, quaternion_wxyz: np.ndarray) -> Pose:
     # cuRobo Pose expects quaternion in wxyz order.
     pos = torch.tensor(position, device="cuda", dtype=torch.float32).view(1, 3)
@@ -262,6 +352,14 @@ def main():
     initial_pose = kin_state.tool_poses[target_link]
     robot_ee_origin = initial_pose.position.squeeze().detach().cpu().numpy().astype(np.float32)
     fixed_quat_wxyz = initial_pose.quaternion.squeeze().detach().cpu().numpy().astype(np.float32)
+    fixed_quat_wxyz = parse_quat_wxyz(fixed_quat_wxyz)
+    if fixed_quat_wxyz is None:
+        fixed_quat_wxyz = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    robot_ee_origin_R = quat_to_matrix_wxyz(fixed_quat_wxyz)
+    if robot_ee_origin_R is None:
+        robot_ee_origin_R = np.eye(3, dtype=np.float32)
+    human_ee_orientation_origin_R = None
+    robot_ee_orientation_origin_R = robot_ee_origin_R.copy()
 
     current_state = ik.get_active_js(initial_state).unsqueeze(0)
     latest_q = current_state.clone()
@@ -286,6 +384,8 @@ def main():
         gui_udp_visibility = server.gui.add_text("visibility", initial_value="--", disabled=True)
         gui_udp_position = server.gui.add_text("udp_position_m", initial_value="--", disabled=True)
         gui_target_position = server.gui.add_text("target_ee_pos_m", initial_value="--", disabled=True)
+        gui_udp_ee_quat = server.gui.add_text("udp_ee_quat_wxyz", initial_value="--", disabled=True)
+        gui_target_quat = server.gui.add_text("target_quat_wxyz", initial_value="--", disabled=True)
         reset_origin_btn = server.gui.add_button("Reset delta origin")
 
     state = {"reset_delta_origin": False}
@@ -340,18 +440,26 @@ def main():
                 gui_set(gui_udp_age, "n/a")
                 gui_set(gui_udp_visibility, "n/a")
                 gui_set(gui_udp_position, "n/a")
+                gui_set(gui_udp_ee_quat, "n/a")
 
             else:
                 udp_packet, recv_t = receiver.get_latest() if receiver is not None else (None, None)
                 udp_age_s = None if recv_t is None else now_t - recv_t
                 packet_is_fresh = udp_age_s is not None and udp_age_s <= args.target_timeout_s
                 source_pos = packet_position(udp_packet, args.mapping_mode)
+                source_quat = packet_ee_quat(udp_packet) if args.use_udp_ee_orientation else None
                 target_valid = bool(packet_is_fresh and source_pos is not None)
 
                 if target_valid:
                     if state["reset_delta_origin"]:
                         human_origin = None
-                        robot_ee_origin = latest_ee_position(ik, latest_q, target_link, robot_ee_origin)
+                        human_ee_orientation_origin_R = None
+                        robot_ee_origin, current_ee_quat = latest_ee_pose(
+                            ik, latest_q, target_link, robot_ee_origin, fixed_quat_wxyz
+                        )
+                        current_ee_R = quat_to_matrix_wxyz(current_ee_quat)
+                        if current_ee_R is not None:
+                            robot_ee_orientation_origin_R = current_ee_R
                         state["reset_delta_origin"] = False
 
                     if args.mapping_mode == "identity":
@@ -370,6 +478,19 @@ def main():
                             )
                         target_position = robot_ee_origin + float(args.teleop_scale) * (source_pos - human_origin)
 
+                    if args.use_udp_ee_orientation and source_quat is not None:
+                        R_human_now = quat_to_matrix_wxyz(source_quat)
+                        if R_human_now is not None:
+                            if human_ee_orientation_origin_R is None:
+                                human_ee_orientation_origin_R = R_human_now.copy()
+                                print("[INFO] Set orientation delta origin from UDP q_world_ee_target_wxyz")
+
+                            delta_R = R_human_now @ human_ee_orientation_origin_R.T
+                            R_robot_target = delta_R @ robot_ee_orientation_origin_R
+                            mapped_quat = matrix_to_quat_wxyz(R_robot_target)
+                            if mapped_quat is not None:
+                                target_quat = mapped_quat
+
                     packet_key = (
                         udp_packet.get("frame_id"),
                         udp_packet.get("stamp_ms"),
@@ -379,6 +500,7 @@ def main():
                 else:
                     if state["reset_delta_origin"]:
                         human_origin = None
+                        human_ee_orientation_origin_R = None
                         state["reset_delta_origin"] = False
 
                 gui_set(gui_udp_valid, bool(udp_packet.get("valid", False)) if udp_packet else False)
@@ -386,6 +508,7 @@ def main():
                 gui_set(gui_udp_visibility, "--" if not udp_packet else udp_packet.get("visibility"))
                 source_display = packet_position(udp_packet, "delta") if udp_packet else None
                 gui_set(gui_udp_position, "--" if source_display is None else np.round(source_display, 4).tolist())
+                gui_set(gui_udp_ee_quat, "--" if source_quat is None else np.round(source_quat, 4).tolist())
 
             if not target_valid or target_position is None:
                 gui_set(gui_status, "lost")
@@ -398,9 +521,10 @@ def main():
 
             if target_control is not None and args.target_source == "udp":
                 target_control.position = filtered_target
-                target_control.wxyz = fixed_quat_wxyz
+                target_control.wxyz = target_quat
 
             gui_set(gui_target_position, np.round(filtered_target, 4).tolist())
+            gui_set(gui_target_quat, np.round(target_quat, 4).tolist())
 
             if not solve_requested:
                 time.sleep(sleep_dt)
@@ -456,6 +580,20 @@ def latest_ee_position(
         return pose.position.squeeze().detach().cpu().numpy().astype(np.float32)
     except Exception:
         return fallback.copy()
+
+
+def latest_ee_pose(ik, joint_state, target_link, fallback_pos, fallback_quat):
+    try:
+        state = ik.compute_kinematics(joint_state.squeeze(0).squeeze(0)).clone()
+        pose = state.tool_poses[target_link]
+        pos = pose.position.squeeze().detach().cpu().numpy().astype(np.float32)
+        quat = pose.quaternion.squeeze().detach().cpu().numpy().astype(np.float32)
+        quat = parse_quat_wxyz(quat)
+        if quat is None:
+            quat = fallback_quat.copy()
+        return pos, quat
+    except Exception:
+        return fallback_pos.copy(), fallback_quat.copy()
 
 
 if __name__ == "__main__":
