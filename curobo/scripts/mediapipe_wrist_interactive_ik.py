@@ -17,15 +17,17 @@ It never sends commands to a real robot.
 import argparse
 import copy
 import json
+import math
 import socket
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
+from curobo._src.state.state_joint import JointState
 from curobo.types import ContentPath, GoalToolPose, Pose
 from curobo.viewer import ViserVisualizer
 
@@ -125,8 +127,35 @@ def parse_args():
     parser.add_argument("--max-step-m", type=float, default=0.03)
     parser.add_argument("--loop-hz", type=float, default=30.0)
 
-    parser.add_argument("--num-seeds", type=int, default=32)
+    parser.add_argument("--num-seeds", type=int, default=64)
     parser.add_argument("--seed-solver-num-seeds", type=int, default=1)
+    parser.add_argument("--return-seeds", type=int, default=32)
+    parser.add_argument("--score-continuity-weight", type=float, default=1.0)
+    parser.add_argument("--score-nominal-weight", type=float, default=0.1)
+    parser.add_argument("--score-limit-weight", type=float, default=0.05)
+    # Recommended first human-arm tuning:
+    #   --score-elbow-swing-weight 0.2 --score-elbow-flexion-weight 0.05
+    parser.add_argument("--score-elbow-flexion-weight", type=float, default=0.05)
+    parser.add_argument("--score-elbow-swing-weight", type=float, default=0.2)
+    parser.add_argument("--score-arm-plane-weight", type=float, default=0.0)
+    parser.add_argument("--score-debug", action="store_true", default=False)
+    parser.add_argument("--robot-shoulder-link", type=str, default="panda_link0")
+    parser.add_argument("--robot-elbow-link", type=str, default="panda_link4")
+    parser.add_argument(
+        "--robot-wrist-link",
+        type=str,
+        default="",
+        help="robot wrist/EE-equivalent link for arm scoring; empty means target_link",
+    )
+    parser.add_argument("--score-elbow-flexion-scale", type=float, default=1.0)
+    parser.add_argument("--score-elbow-swing-scale", type=float, default=1.0)
+    parser.add_argument("--score-arm-confidence-gate", type=float, default=0.3)
+    parser.add_argument(
+        "--auto-init-elbow-swing-offset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="auto initialize human/robot elbow swing offset when both are valid",
+    )
     parser.add_argument(
         "--use-cuda-graph",
         action="store_true",
@@ -386,6 +415,658 @@ def gui_vec(value, digits=4):
     return "--" if value is None else np.round(value, digits).tolist()
 
 
+def joint_state_position_1d(value) -> torch.Tensor:
+    position = value.position if hasattr(value, "position") else value
+    return position.squeeze().reshape(-1)
+
+
+def joint_state_from_q(q: torch.Tensor, joint_names=None) -> JointState:
+    q = q.reshape(1, 1, -1).clone()
+    return JointState.from_position(q, joint_names=joint_names)
+
+
+def extract_successful_ik_candidates(result) -> List[torch.Tensor]:
+    """Extract successful IK candidate joint vectors from a cuRobo result."""
+    if result is None or getattr(result, "js_solution", None) is None:
+        return []
+
+    solutions = result.js_solution.position if hasattr(result.js_solution, "position") else result.js_solution
+    if solutions is None or solutions.numel() == 0:
+        return []
+
+    dof = int(solutions.shape[-1])
+    flat_q = solutions.reshape(-1, dof)
+    success = getattr(result, "success", None)
+
+    if success is None:
+        return [q.reshape(-1) for q in flat_q] if ik_success(result) else []
+
+    if not isinstance(success, torch.Tensor):
+        return [q.reshape(-1) for q in flat_q] if bool(success) else []
+
+    success = success.detach()
+    if success.numel() == 1:
+        return [q.reshape(-1) for q in flat_q] if bool(success.reshape(-1)[0].item()) else []
+
+    flat_success = success.reshape(-1).to(device=flat_q.device)
+    if flat_success.numel() == flat_q.shape[0]:
+        return [flat_q[i].reshape(-1) for i in range(flat_q.shape[0]) if bool(flat_success[i].item())]
+
+    if not getattr(extract_successful_ik_candidates, "_warned_mismatch", False):
+        print(
+            "[WARN] IK success shape does not match candidate count; "
+            "falling back to the first solution when overall success is true."
+        )
+        extract_successful_ik_candidates._warned_mismatch = True
+    return [flat_q[0].reshape(-1)] if ik_success(result) else []
+
+
+def _tensor_like_1d(value, q: torch.Tensor) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    tensor = joint_state_position_1d(value).to(device=q.device, dtype=q.dtype)
+    if tensor.numel() != q.numel():
+        return None
+    return tensor.reshape(-1)
+
+
+def get_active_joint_limits_or_none(ik, dof: int, device, dtype):
+    """Best-effort joint-limit lookup across cuRobo versions/config layouts."""
+    candidates = [
+        lambda: ik.kinematics.get_joint_limits(),
+        lambda: ik.core.kinematics.get_joint_limits(),
+        lambda: ik.kinematics.config.get_joint_limits(),
+        lambda: ik.core.kinematics.config.get_joint_limits(),
+        lambda: ik.config.robot_cfg.kinematics.kinematics_config.joint_limits,
+        lambda: ik.config.robot_cfg.kinematics.joint_limits,
+        lambda: ik.config.kinematics_config.joint_limits,
+    ]
+
+    for getter in candidates:
+        try:
+            limits = getter()
+            position = getattr(limits, "position", None)
+            if position is None:
+                continue
+            position = position.to(device=device, dtype=dtype)
+            if position.ndim != 2 or position.shape[0] != 2:
+                continue
+            if position.shape[1] == dof:
+                return position[0].reshape(-1), position[1].reshape(-1)
+            names = getattr(limits, "joint_names", None)
+            active_names = getattr(ik, "joint_names", None)
+            if names is not None and active_names is not None and len(active_names) == dof:
+                indices = [names.index(name) for name in active_names if name in names]
+                if len(indices) == dof:
+                    active_position = position[:, indices]
+                    return active_position[0].reshape(-1), active_position[1].reshape(-1)
+        except Exception:
+            continue
+
+    if not getattr(get_active_joint_limits_or_none, "_warned", False):
+        print("[WARN] Could not read joint limits; disabling limit-margin score.")
+        get_active_joint_limits_or_none._warned = True
+    return None, None
+
+
+def wrap_to_pi_torch(angle: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
+def normalize_torch_vec(v: Optional[torch.Tensor], eps: float = 1.0e-8) -> Optional[torch.Tensor]:
+    if v is None:
+        return None
+    v = v.reshape(-1)
+    if v.numel() != 3 or not torch.isfinite(v).all():
+        return None
+    n = torch.linalg.norm(v)
+    if not torch.isfinite(n) or float(n.detach().cpu()) < eps:
+        return None
+    return v / n.clamp_min(eps)
+
+
+def as_torch_vec3(value, q: torch.Tensor) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    try:
+        tensor = torch.as_tensor(value, device=q.device, dtype=q.dtype).reshape(-1)
+    except Exception:
+        return None
+    if tensor.numel() != 3 or not torch.isfinite(tensor).all():
+        return None
+    return tensor
+
+
+def get_pose_position_from_state(kin_state, link_name: str) -> Optional[torch.Tensor]:
+    tool_poses = getattr(kin_state, "tool_poses", None)
+    if tool_poses is None:
+        return None
+    frames = getattr(tool_poses, "tool_frames", None)
+    if frames is None or link_name not in frames:
+        return None
+    try:
+        pose = tool_poses.get_link_pose(link_name)
+        return pose.position.reshape(-1, 3)[0]
+    except Exception:
+        return None
+
+
+def compute_robot_arm_points_world(
+    ik,
+    q,
+    target_link,
+    shoulder_link,
+    elbow_link,
+    wrist_link,
+) -> dict:
+    wrist_link = wrist_link or target_link
+    q = q.reshape(-1)
+    arm_fk = getattr(ik, "_arm_scoring_kinematics", None) or getattr(ik, "kinematics", None)
+    if arm_fk is None:
+        return {"valid": False, "shoulder": None, "elbow": None, "wrist": None, "reason": "no FK model"}
+
+    q_fk = q
+    model_dof = getattr(arm_fk, "dof", None)
+    if model_dof is not None and q_fk.numel() != int(model_dof):
+        try:
+            active_js = JointState.from_position(
+                q.reshape(1, 1, -1),
+                joint_names=ik.joint_names if q.numel() == len(ik.joint_names) else None,
+            )
+            full_js = ik.get_full_js(active_js)
+            q_full = full_js.position.squeeze().reshape(-1)
+            if q_full.numel() == int(model_dof):
+                q_fk = q_full
+        except Exception:
+            pass
+
+    if model_dof is not None and q_fk.numel() != int(model_dof):
+        return {
+            "valid": False,
+            "shoulder": None,
+            "elbow": None,
+            "wrist": None,
+            "reason": f"q dof {q_fk.numel()} != FK dof {model_dof}",
+        }
+
+    try:
+        joint_state = JointState.from_position(q_fk.reshape(1, 1, -1), joint_names=None)
+        kin_state = arm_fk.compute_kinematics(joint_state)
+    except Exception as exc:
+        return {"valid": False, "shoulder": None, "elbow": None, "wrist": None, "reason": f"FK failed: {exc}"}
+
+    shoulder = get_pose_position_from_state(kin_state, shoulder_link)
+    elbow = get_pose_position_from_state(kin_state, elbow_link)
+    wrist = get_pose_position_from_state(kin_state, wrist_link)
+    if shoulder is None or elbow is None or wrist is None:
+        frames = getattr(getattr(kin_state, "tool_poses", None), "tool_frames", [])
+        reason = (
+            f"missing link pose(s): shoulder={shoulder_link in frames}, "
+            f"elbow={elbow_link in frames}, wrist={wrist_link in frames}; "
+            f"available={frames}"
+        )
+        if not getattr(compute_robot_arm_points_world, "_warned_missing_link", False):
+            print("[WARN] Could not find robot arm scoring links; human arm scoring terms disabled until links are fixed.")
+            print(f"[WARN] {reason}")
+            compute_robot_arm_points_world._warned_missing_link = True
+        return {"valid": False, "shoulder": shoulder, "elbow": elbow, "wrist": wrist, "reason": reason}
+
+    return {"valid": True, "shoulder": shoulder, "elbow": elbow, "wrist": wrist, "reason": "ok"}
+
+
+def compute_flexion_angle_from_points(p_s, p_e, p_w, eps: float = 1.0e-8):
+    v1 = p_s - p_e
+    v2 = p_w - p_e
+    n1 = torch.linalg.norm(v1)
+    n2 = torch.linalg.norm(v2)
+    if float(n1.detach().cpu()) < eps or float(n2.detach().cpu()) < eps:
+        return None
+    cos_theta = torch.dot(v1, v2) / (n1.clamp_min(eps) * n2.clamp_min(eps))
+    theta_internal = torch.acos(torch.clamp(cos_theta, -1.0, 1.0))
+    return torch.as_tensor(math.pi, device=p_s.device, dtype=p_s.dtype) - theta_internal
+
+
+def compute_arm_plane_normal_from_points(p_s, p_e, p_w, eps: float = 1.0e-8):
+    upper = p_e - p_s
+    forearm = p_w - p_e
+    normal = torch.cross(upper, forearm, dim=0)
+    return normalize_torch_vec(normal, eps=eps)
+
+
+def compute_signed_swing_angle(n_ref, n_now, axis):
+    n_ref = normalize_torch_vec(n_ref)
+    n_now = normalize_torch_vec(n_now)
+    axis = normalize_torch_vec(axis)
+    if n_ref is None or n_now is None or axis is None:
+        return None
+    n_ref = normalize_torch_vec(n_ref - axis * torch.dot(n_ref, axis))
+    n_now = normalize_torch_vec(n_now - axis * torch.dot(n_now, axis))
+    if n_ref is None or n_now is None:
+        return None
+    numerator = torch.dot(axis, torch.cross(n_ref, n_now, dim=0))
+    denominator = torch.dot(n_ref, n_now)
+    return torch.atan2(numerator, denominator)
+
+
+def human_arm_terms_requested(args) -> bool:
+    return (
+        float(args.score_elbow_flexion_weight) != 0.0
+        or float(args.score_elbow_swing_weight) != 0.0
+        or float(args.score_arm_plane_weight) != 0.0
+    )
+
+
+def safe_tensor_term(value: Optional[torch.Tensor], q: torch.Tensor) -> torch.Tensor:
+    if value is None or not torch.isfinite(value).all():
+        return torch.zeros((), device=q.device, dtype=q.dtype)
+    return value.reshape(())
+
+
+def tensor_to_float_or_none(value: Optional[torch.Tensor]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if not torch.isfinite(value).all():
+            return None
+        return float(value.detach().cpu().item())
+    except Exception:
+        return None
+
+
+def compute_robot_arm_metric_info(
+    ik,
+    q: torch.Tensor,
+    target_link: str,
+    args,
+    elbow_swing_state: Optional[dict] = None,
+    initialize_ref: bool = False,
+) -> dict:
+    """Compute robot-side elbow flexion and swing for display/scoring diagnostics."""
+    info = {
+        "robot_arm_valid": False,
+        "robot_arm_reason": "not computed",
+        "robot_elbow_flexion_rad": None,
+        "robot_elbow_flexion_deg": None,
+        "robot_elbow_swing_rad": None,
+        "robot_elbow_swing_deg": None,
+        "robot_arm_plane_normal": None,
+    }
+
+    q = q.reshape(-1)
+    robot_points = compute_robot_arm_points_world(
+        ik=ik,
+        q=q,
+        target_link=target_link,
+        shoulder_link=args.robot_shoulder_link,
+        elbow_link=args.robot_elbow_link,
+        wrist_link=args.robot_wrist_link or target_link,
+    )
+    info["robot_arm_valid"] = bool(robot_points.get("valid", False))
+    info["robot_arm_reason"] = robot_points.get("reason", "unknown")
+    if not info["robot_arm_valid"]:
+        return info
+
+    p_s = robot_points["shoulder"]
+    p_e = robot_points["elbow"]
+    p_w = robot_points["wrist"]
+    robot_flex = compute_flexion_angle_from_points(p_s, p_e, p_w)
+    robot_normal = compute_arm_plane_normal_from_points(p_s, p_e, p_w)
+    robot_swing = None
+
+    if robot_normal is not None and elbow_swing_state is not None:
+        if initialize_ref and elbow_swing_state.get("robot_plane_ref") is None:
+            elbow_swing_state["robot_plane_ref"] = robot_normal.detach().clone()
+            print("[INFO] Auto set robot elbow plane reference for swing display/scoring.")
+        robot_ref = elbow_swing_state.get("robot_plane_ref")
+        axis = normalize_torch_vec(p_w - p_s)
+        robot_swing = compute_signed_swing_angle(robot_ref, robot_normal, axis)
+
+    flex_rad = tensor_to_float_or_none(robot_flex)
+    swing_rad = tensor_to_float_or_none(robot_swing)
+    info.update(
+        {
+            "robot_elbow_flexion_rad": flex_rad,
+            "robot_elbow_flexion_deg": None if flex_rad is None else flex_rad * 180.0 / math.pi,
+            "robot_elbow_swing_rad": swing_rad,
+            "robot_elbow_swing_deg": None if swing_rad is None else swing_rad * 180.0 / math.pi,
+            "robot_arm_plane_normal": robot_normal,
+        }
+    )
+    return info
+
+
+def score_candidate_q(
+    q: torch.Tensor,
+    q_prev: torch.Tensor,
+    q_nominal: torch.Tensor,
+    q_min: Optional[torch.Tensor],
+    q_max: Optional[torch.Tensor],
+    latest_arm_config: dict,
+    ik: InverseKinematics,
+    target_link: str,
+    args,
+    elbow_swing_state: dict,
+) -> Tuple[torch.Tensor, dict]:
+    """Score one IK candidate.
+
+    External selection:
+        Q_valid = {q_i | cuRobo IK succeeded}
+        q* = argmin J_select(q_i)
+
+    J_select =
+        w_cont E_cont
+      + w_nom E_nom
+      + w_limit E_limit
+      + c_arm (w_flex E_flex + w_swing E_swing + w_plane E_plane)
+
+    Robot flexion:
+        theta_flex_r = pi - angle(p_s - p_e, p_w - p_e)
+
+    Robot arm plane:
+        n_r = normalize((p_e - p_s) x (p_w - p_e))
+
+    Robot swing:
+        psi_r = atan2(axis dot (n_r0 x n_r), n_r0 dot n_r)
+        axis = normalize(p_w - p_s)
+
+    Swing matching uses an initial human/robot offset:
+        offset0 = wrap_to_pi(psi_r0 - gamma_s * psi_h0)
+        E_swing = wrap_to_pi(psi_r - gamma_s * psi_h - offset0)^2
+    """
+    q = q.reshape(-1)
+    huge = torch.tensor(1.0e9, device=q.device, dtype=q.dtype)
+    zero = torch.zeros((), device=q.device, dtype=q.dtype)
+    if not torch.isfinite(q).all():
+        return huge, {
+            "total": 1.0e9,
+            "continuity": 1.0e9,
+            "nominal": 0.0,
+            "limit": 0.0,
+            "elbow_flexion": 0.0,
+            "elbow_swing": 0.0,
+            "arm_plane": 0.0,
+            "robot_arm_valid": False,
+            "robot_arm_reason": "candidate q invalid",
+        }
+
+    q_prev = _tensor_like_1d(q_prev, q)
+    q_nominal = _tensor_like_1d(q_nominal, q)
+
+    q_range = torch.ones_like(q)
+    limit_term = torch.zeros((), device=q.device, dtype=q.dtype)
+    if q_min is not None and q_max is not None:
+        q_min = _tensor_like_1d(q_min, q)
+        q_max = _tensor_like_1d(q_max, q)
+        if q_min is not None and q_max is not None:
+            q_range = (q_max - q_min).abs().clamp_min(1.0e-6)
+            q_mid = 0.5 * (q_min + q_max)
+            radius = (0.5 * (q_max - q_min).abs()).clamp_min(1.0e-6)
+            limit_term = torch.mean(((q - q_mid) / radius) ** 4)
+
+    continuity = (
+        torch.mean(((q - q_prev) / q_range) ** 2)
+        if q_prev is not None
+        else torch.zeros((), device=q.device, dtype=q.dtype)
+    )
+    nominal = (
+        torch.mean(((q - q_nominal) / q_range) ** 2)
+        if q_nominal is not None
+        else torch.zeros((), device=q.device, dtype=q.dtype)
+    )
+
+    elbow_flexion = zero
+    elbow_swing = zero
+    arm_plane = zero
+    robot_flex = None
+    robot_swing = None
+    human_flex = None
+    human_swing = None
+    arm_confidence = 0.0
+    robot_arm_valid = False
+    robot_arm_reason = "human arm terms disabled"
+
+    confidence = float(latest_arm_config.get("confidence", 0.0) or 0.0) if latest_arm_config else 0.0
+    arm_confidence = float(np.clip(confidence, 0.0, 1.0))
+    confidence_ok = arm_confidence >= float(args.score_arm_confidence_gate)
+    has_human_arm_config = bool(
+        latest_arm_config
+        and (latest_arm_config.get("valid", False) or latest_arm_config.get("plane_valid", False))
+    )
+    # Robot elbow metrics are cheap enough and useful as diagnostics, so compute them even when
+    # human-arm scoring weights are zero or human confidence is currently gated out.
+    needs_robot_arm = True
+    can_score_human_arm = human_arm_terms_requested(args) and confidence_ok and has_human_arm_config
+
+    if human_arm_terms_requested(args) and not confidence_ok:
+        robot_arm_reason = f"arm confidence {arm_confidence:.3f} below gate"
+    elif human_arm_terms_requested(args) and not has_human_arm_config:
+        robot_arm_reason = "no valid human arm config"
+
+    robot_points = None
+    robot_normal = None
+    if needs_robot_arm:
+        robot_points = compute_robot_arm_points_world(
+            ik=ik,
+            q=q,
+            target_link=target_link,
+            shoulder_link=args.robot_shoulder_link,
+            elbow_link=args.robot_elbow_link,
+            wrist_link=args.robot_wrist_link or target_link,
+        )
+        robot_arm_valid = bool(robot_points.get("valid", False))
+        robot_arm_reason = robot_points.get("reason", "unknown")
+        if robot_arm_valid:
+            p_s = robot_points["shoulder"]
+            p_e = robot_points["elbow"]
+            p_w = robot_points["wrist"]
+            robot_flex = compute_flexion_angle_from_points(p_s, p_e, p_w)
+            robot_normal = compute_arm_plane_normal_from_points(p_s, p_e, p_w)
+
+            if robot_normal is not None and elbow_swing_state.get("robot_plane_ref") is None:
+                prev_points = compute_robot_arm_points_world(
+                    ik=ik,
+                    q=q_prev,
+                    target_link=target_link,
+                    shoulder_link=args.robot_shoulder_link,
+                    elbow_link=args.robot_elbow_link,
+                    wrist_link=args.robot_wrist_link or target_link,
+                )
+                if prev_points.get("valid", False):
+                    prev_normal = compute_arm_plane_normal_from_points(
+                        prev_points["shoulder"], prev_points["elbow"], prev_points["wrist"]
+                    )
+                    if prev_normal is not None:
+                        elbow_swing_state["robot_plane_ref"] = prev_normal.detach().clone()
+                        print("[INFO] Auto set robot elbow plane reference for swing scoring.")
+
+            robot_ref = elbow_swing_state.get("robot_plane_ref")
+            axis = normalize_torch_vec(p_w - p_s)
+            robot_swing = compute_signed_swing_angle(robot_ref, robot_normal, axis)
+
+    if can_score_human_arm and robot_arm_valid:
+        if (
+            float(args.score_elbow_flexion_weight) != 0.0
+            and latest_arm_config.get("valid", False)
+            and latest_arm_config.get("elbow_flexion_angle_rad") is not None
+            and robot_flex is not None
+        ):
+            human_flex = torch.as_tensor(
+                float(latest_arm_config["elbow_flexion_angle_rad"]),
+                device=q.device,
+                dtype=q.dtype,
+            )
+            elbow_flexion = (robot_flex - float(args.score_elbow_flexion_scale) * human_flex) ** 2
+
+        if (
+            float(args.score_arm_plane_weight) != 0.0
+            and latest_arm_config.get("plane_valid", False)
+            and robot_normal is not None
+        ):
+            human_normal = normalize_torch_vec(as_torch_vec3(latest_arm_config.get("arm_plane_normal_world"), q))
+            if human_normal is not None:
+                dot = torch.clamp(torch.dot(robot_normal, human_normal), -1.0, 1.0)
+                arm_plane = 1.0 - torch.abs(dot)
+
+        if (
+            float(args.score_elbow_swing_weight) != 0.0
+            and latest_arm_config.get("plane_valid", False)
+            and latest_arm_config.get("elbow_swing_angle_signed_rad") is not None
+            and robot_normal is not None
+        ):
+            human_swing = torch.as_tensor(
+                float(latest_arm_config["elbow_swing_angle_signed_rad"]),
+                device=q.device,
+                dtype=q.dtype,
+            )
+
+            if (
+                args.auto_init_elbow_swing_offset
+                and elbow_swing_state.get("human_robot_swing_offset") is None
+                and robot_ref is not None
+            ):
+                prev_points = compute_robot_arm_points_world(
+                    ik=ik,
+                    q=q_prev,
+                    target_link=target_link,
+                    shoulder_link=args.robot_shoulder_link,
+                    elbow_link=args.robot_elbow_link,
+                    wrist_link=args.robot_wrist_link or target_link,
+                )
+                if prev_points.get("valid", False):
+                    prev_normal = compute_arm_plane_normal_from_points(
+                        prev_points["shoulder"], prev_points["elbow"], prev_points["wrist"]
+                    )
+                    prev_axis = normalize_torch_vec(prev_points["wrist"] - prev_points["shoulder"])
+                    prev_swing = compute_signed_swing_angle(robot_ref, prev_normal, prev_axis)
+                    if prev_swing is not None:
+                        offset = wrap_to_pi_torch(prev_swing - float(args.score_elbow_swing_scale) * human_swing)
+                        elbow_swing_state["human_robot_swing_offset"] = offset.detach().clone()
+                        human_deg = float(human_swing.detach().cpu()) * 180.0 / math.pi
+                        prev_deg = float(prev_swing.detach().cpu()) * 180.0 / math.pi
+                        offset_deg = float(offset.detach().cpu()) * 180.0 / math.pi
+                        elbow_swing_state["elbow_swing_offset_status"] = (
+                            f"set human={human_deg:+.2f} prev={prev_deg:+.2f} offset={offset_deg:+.2f} deg"
+                        )
+                        print(
+                            "[INFO] Auto set elbow swing offset: "
+                            f"human_swing={human_deg:+.2f} deg, "
+                            f"prev_robot_swing={prev_deg:+.2f} deg, "
+                            f"offset={offset_deg:+.2f} deg"
+                        )
+
+            offset = elbow_swing_state.get("human_robot_swing_offset")
+            if robot_swing is not None and offset is not None:
+                swing_error = wrap_to_pi_torch(
+                    robot_swing
+                    - float(args.score_elbow_swing_scale) * human_swing
+                    - offset.to(device=q.device, dtype=q.dtype)
+                )
+                elbow_swing = swing_error ** 2
+
+    elbow_flexion = safe_tensor_term(elbow_flexion, q)
+    elbow_swing = safe_tensor_term(elbow_swing, q)
+    arm_plane = safe_tensor_term(arm_plane, q)
+
+    total = (
+        float(args.score_continuity_weight) * continuity
+        + float(args.score_nominal_weight) * nominal
+        + float(args.score_limit_weight) * limit_term
+        + arm_confidence * float(args.score_elbow_flexion_weight) * elbow_flexion
+        + arm_confidence * float(args.score_elbow_swing_weight) * elbow_swing
+        + arm_confidence * float(args.score_arm_plane_weight) * arm_plane
+    )
+    if not torch.isfinite(total):
+        total = huge
+
+    def scalar(value: torch.Tensor) -> float:
+        try:
+            return float(value.detach().cpu().item())
+        except Exception:
+            return float("inf")
+
+    return total, {
+        "total": scalar(total),
+        "continuity": scalar(continuity),
+        "nominal": scalar(nominal),
+        "limit": scalar(limit_term),
+        "elbow_flexion": scalar(elbow_flexion),
+        "elbow_swing": scalar(elbow_swing),
+        "arm_plane": scalar(arm_plane),
+        "robot_elbow_flexion_rad": tensor_to_float_or_none(robot_flex),
+        "robot_elbow_flexion_deg": (
+            None if tensor_to_float_or_none(robot_flex) is None else tensor_to_float_or_none(robot_flex) * 180.0 / math.pi
+        ),
+        "robot_elbow_swing_rad": tensor_to_float_or_none(robot_swing),
+        "robot_elbow_swing_deg": (
+            None if tensor_to_float_or_none(robot_swing) is None else tensor_to_float_or_none(robot_swing) * 180.0 / math.pi
+        ),
+        "human_elbow_flexion_rad": tensor_to_float_or_none(human_flex),
+        "human_elbow_swing_rad": tensor_to_float_or_none(human_swing),
+        "elbow_swing_offset_rad": tensor_to_float_or_none(elbow_swing_state.get("human_robot_swing_offset")),
+        "elbow_swing_offset_status": elbow_swing_state.get("elbow_swing_offset_status"),
+        "arm_confidence": arm_confidence,
+        "robot_arm_valid": robot_arm_valid,
+        "robot_arm_reason": robot_arm_reason,
+    }
+
+
+def select_best_ik_solution(
+    candidates: List[torch.Tensor],
+    q_prev: torch.Tensor,
+    q_nominal: torch.Tensor,
+    q_min,
+    q_max,
+    latest_arm_config: dict,
+    ik,
+    target_link,
+    args,
+    elbow_swing_state: dict,
+) -> Tuple[Optional[torch.Tensor], dict]:
+    if not candidates:
+        return None, {"num_candidates": 0}
+
+    best_q = None
+    best_score = None
+    best_info = {"num_candidates": len(candidates), "best_index": None}
+    for idx, candidate in enumerate(candidates):
+        score, info = score_candidate_q(
+            candidate,
+            q_prev=q_prev,
+            q_nominal=q_nominal,
+            q_min=q_min,
+            q_max=q_max,
+            latest_arm_config=latest_arm_config,
+            ik=ik,
+            target_link=target_link,
+            args=args,
+            elbow_swing_state=elbow_swing_state,
+        )
+        if args.score_debug:
+            offset = info.get("elbow_swing_offset_rad")
+            print(
+                "[DEBUG] IK candidate "
+                f"{idx}: total={info['total']:.6f}, cont={info['continuity']:.6f}, "
+                f"nom={info['nominal']:.6f}, limit={info['limit']:.6f}, "
+                f"flex={info['elbow_flexion']:.6f}, swing={info['elbow_swing']:.6f}, "
+                f"plane={info['arm_plane']:.6f}, "
+                f"robot_flex={gui_float(info.get('robot_elbow_flexion_deg'), 2)} deg, "
+                f"robot_swing={gui_float(info.get('robot_elbow_swing_deg'), 2)} deg, "
+                f"human_flex={gui_float(latest_arm_config.get('elbow_flexion_angle_deg'), 2)} deg, "
+                f"human_swing={gui_float(latest_arm_config.get('elbow_swing_angle_signed_deg'), 2)} deg, "
+                f"offset={gui_float(None if offset is None else offset * 180.0 / math.pi, 2)} deg"
+            )
+
+        if best_score is None or bool((score < best_score).item()):
+            best_score = score
+            best_q = candidate.reshape(-1)
+            best_info = {"best_index": idx, "num_candidates": len(candidates), **info}
+
+    if best_q is None or best_score is None or not torch.isfinite(best_score):
+        return None, {"num_candidates": len(candidates), "best_index": None}
+
+    return best_q, best_info
+
+
 def main():
     args = parse_args()
 
@@ -416,6 +1097,8 @@ def main():
             num_seeds=args.num_seeds,
         )
     ik = InverseKinematics(config)
+    if hasattr(visualizer, "_kinematics"):
+        ik._arm_scoring_kinematics = visualizer._kinematics
     if hasattr(ik.config, "use_lm_seed"):
         ik.config.use_lm_seed = False
     if hasattr(ik.config, "exit_early"):
@@ -438,6 +1121,13 @@ def main():
 
     current_state = ik.get_active_js(initial_state).unsqueeze(0)
     latest_q = current_state.clone()
+    q_nominal = joint_state_position_1d(ik.get_active_js(initial_state)).detach().clone()
+    q_min, q_max = get_active_joint_limits_or_none(
+        ik,
+        dof=int(q_nominal.numel()),
+        device=q_nominal.device,
+        dtype=q_nominal.dtype,
+    )
 
     target_control = None
     if hasattr(visualizer, "_control_frames"):
@@ -468,13 +1158,101 @@ def main():
         gui_elbow_swing_signed_deg = server.gui.add_text("elbow_swing_signed_deg", initial_value="--", disabled=True)
         gui_arm_plane_valid = server.gui.add_text("arm_plane_valid", initial_value="false", disabled=True)
         gui_arm_plane_normal_world = server.gui.add_text("arm_plane_normal_world", initial_value="--", disabled=True)
+        gui_ik_return_seeds = server.gui.add_text("ik_return_seeds", initial_value=str(args.return_seeds), disabled=True)
+        gui_ik_candidate_count = server.gui.add_text("ik_candidate_count", initial_value="--", disabled=True)
+        gui_selected_candidate_index = server.gui.add_text("selected_candidate_index", initial_value="--", disabled=True)
+        gui_score_total = server.gui.add_text("score_total", initial_value="--", disabled=True)
+        gui_score_continuity = server.gui.add_text("score_continuity", initial_value="--", disabled=True)
+        gui_score_nominal = server.gui.add_text("score_nominal", initial_value="--", disabled=True)
+        gui_score_limit = server.gui.add_text("score_limit", initial_value="--", disabled=True)
+        gui_score_elbow_flexion = server.gui.add_text("score_elbow_flexion", initial_value="--", disabled=True)
+        gui_score_elbow_swing = server.gui.add_text("score_elbow_swing", initial_value="--", disabled=True)
+        gui_score_arm_plane = server.gui.add_text("score_arm_plane", initial_value="--", disabled=True)
+        gui_robot_arm_valid = server.gui.add_text("robot_arm_valid", initial_value="false", disabled=True)
+        gui_robot_arm_reason = server.gui.add_text("robot_arm_reason", initial_value="--", disabled=True)
+        gui_robot_elbow_flexion_deg = server.gui.add_text("robot_elbow_flexion_deg", initial_value="--", disabled=True)
+        gui_robot_elbow_swing_deg = server.gui.add_text("robot_elbow_swing_deg", initial_value="--", disabled=True)
+        gui_elbow_swing_offset_deg = server.gui.add_text("elbow_swing_offset_deg", initial_value="--", disabled=True)
+        gui_elbow_swing_offset_status = server.gui.add_text("elbow_swing_offset_status", initial_value="not initialized", disabled=True)
+        gui_arm_score_confidence = server.gui.add_text("arm_score_confidence", initial_value="--", disabled=True)
         reset_origin_btn = server.gui.add_button("Reset delta origin")
+        reset_swing_offset_btn = server.gui.add_button("Reset elbow swing offset")
 
-    state = {"reset_delta_origin": False}
+    state = {
+        "reset_delta_origin": False,
+        "robot_plane_ref": None,
+        "human_robot_swing_offset": None,
+        "elbow_swing_offset_status": "not initialized",
+    }
 
     @reset_origin_btn.on_click
     def _reset_delta_origin(_):
         state["reset_delta_origin"] = True
+        state["robot_plane_ref"] = None
+        state["human_robot_swing_offset"] = None
+        state["elbow_swing_offset_status"] = "reset with delta origin"
+        gui_set(gui_elbow_swing_offset_status, state["elbow_swing_offset_status"])
+        update_current_robot_arm_gui()
+
+    @reset_swing_offset_btn.on_click
+    def _reset_swing_offset(_):
+        state["robot_plane_ref"] = None
+        state["human_robot_swing_offset"] = None
+        state["elbow_swing_offset_status"] = "manual reset"
+        gui_set(gui_elbow_swing_offset_status, state["elbow_swing_offset_status"])
+        update_current_robot_arm_gui()
+
+    def clear_score_gui():
+        gui_set(gui_ik_candidate_count, "--")
+        gui_set(gui_selected_candidate_index, "--")
+        gui_set(gui_score_total, "--")
+        gui_set(gui_score_continuity, "--")
+        gui_set(gui_score_nominal, "--")
+        gui_set(gui_score_limit, "--")
+        gui_set(gui_score_elbow_flexion, "--")
+        gui_set(gui_score_elbow_swing, "--")
+        gui_set(gui_score_arm_plane, "--")
+        gui_set(gui_elbow_swing_offset_deg, "--")
+        gui_set(gui_elbow_swing_offset_status, state.get("elbow_swing_offset_status", "--"))
+        gui_set(gui_arm_score_confidence, "--")
+
+    def update_score_gui(info: dict):
+        gui_set(gui_ik_candidate_count, info.get("num_candidates", "--"))
+        gui_set(gui_selected_candidate_index, info.get("best_index", "--"))
+        gui_set(gui_score_total, gui_float(info.get("total"), 6))
+        gui_set(gui_score_continuity, gui_float(info.get("continuity"), 6))
+        gui_set(gui_score_nominal, gui_float(info.get("nominal"), 6))
+        gui_set(gui_score_limit, gui_float(info.get("limit"), 6))
+        gui_set(gui_score_elbow_flexion, gui_float(info.get("elbow_flexion"), 6))
+        gui_set(gui_score_elbow_swing, gui_float(info.get("elbow_swing"), 6))
+        gui_set(gui_score_arm_plane, gui_float(info.get("arm_plane"), 6))
+        if "robot_arm_valid" in info:
+            gui_set(gui_robot_arm_valid, bool(info.get("robot_arm_valid", False)))
+            gui_set(gui_robot_arm_reason, info.get("robot_arm_reason") or "--")
+        if "robot_elbow_flexion_deg" in info:
+            gui_set(gui_robot_elbow_flexion_deg, gui_float(info.get("robot_elbow_flexion_deg"), 2))
+        if "robot_elbow_swing_deg" in info:
+            gui_set(gui_robot_elbow_swing_deg, gui_float(info.get("robot_elbow_swing_deg"), 2))
+        offset = info.get("elbow_swing_offset_rad")
+        gui_set(gui_elbow_swing_offset_deg, "--" if offset is None else gui_float(offset * 180.0 / math.pi, 2))
+        gui_set(gui_elbow_swing_offset_status, info.get("elbow_swing_offset_status") or state.get("elbow_swing_offset_status", "--"))
+        gui_set(gui_arm_score_confidence, gui_float(info.get("arm_confidence"), 3))
+
+    def update_current_robot_arm_gui():
+        info = compute_robot_arm_metric_info(
+            ik=ik,
+            q=joint_state_position_1d(current_state).detach(),
+            target_link=target_link,
+            args=args,
+            elbow_swing_state=state,
+            initialize_ref=True,
+        )
+        gui_set(gui_robot_arm_valid, bool(info.get("robot_arm_valid", False)))
+        gui_set(gui_robot_arm_reason, info.get("robot_arm_reason") or "--")
+        gui_set(gui_robot_elbow_flexion_deg, gui_float(info.get("robot_elbow_flexion_deg"), 2))
+        gui_set(gui_robot_elbow_swing_deg, gui_float(info.get("robot_elbow_swing_deg"), 2))
+
+    update_current_robot_arm_gui()
 
     receiver = None
     if args.target_source == "udp":
@@ -483,6 +1261,10 @@ def main():
     print(f"\ncuRobo wrist IK viewer: http://localhost:{args.port}")
     print(f"Robot: {args.robot}, target link: {target_link}")
     print(f"Target source: {args.target_source}, mapping mode: {args.mapping_mode}")
+    print(f"IK return_seeds: {args.return_seeds}")
+    print(f"[INFO] robot shoulder link for scoring: {args.robot_shoulder_link}")
+    print(f"[INFO] robot elbow link for scoring: {args.robot_elbow_link}")
+    print(f"[INFO] robot wrist link for scoring: {args.robot_wrist_link or target_link}")
     print("This script only visualizes IK. It does not command a real robot.")
     print("Press Ctrl+C to exit.\n")
 
@@ -533,6 +1315,7 @@ def main():
                 gui_set(gui_elbow_swing_signed_deg, "n/a")
                 gui_set(gui_arm_plane_valid, "n/a")
                 gui_set(gui_arm_plane_normal_world, "n/a")
+                clear_score_gui()
 
             else:
                 udp_packet, recv_t = receiver.get_latest() if receiver is not None else (None, None)
@@ -548,6 +1331,9 @@ def main():
                     if state["reset_delta_origin"]:
                         human_origin = None
                         human_ee_orientation_origin_R = None
+                        state["robot_plane_ref"] = None
+                        state["human_robot_swing_offset"] = None
+                        state["elbow_swing_offset_status"] = "reset with delta origin"
                         robot_ee_origin, current_ee_quat = latest_ee_pose(
                             ik, latest_q, target_link, robot_ee_origin, fixed_quat_wxyz
                         )
@@ -595,6 +1381,9 @@ def main():
                     if state["reset_delta_origin"]:
                         human_origin = None
                         human_ee_orientation_origin_R = None
+                        state["robot_plane_ref"] = None
+                        state["human_robot_swing_offset"] = None
+                        state["elbow_swing_offset_status"] = "reset with delta origin"
                         state["reset_delta_origin"] = False
 
                 gui_set(gui_udp_valid, bool(udp_packet.get("valid", False)) if udp_packet else False)
@@ -613,6 +1402,7 @@ def main():
 
             if not target_valid or target_position is None:
                 gui_set(gui_status, "lost")
+                clear_score_gui()
                 update_marker(target_marker, filtered_target if filtered_target is not None else robot_ee_origin, (140, 140, 140))
                 time.sleep(sleep_dt)
                 continue
@@ -641,23 +1431,46 @@ def main():
                         num_goalset=1,
                     ),
                     current_state=active_js.squeeze(1).clone(),
-                    return_seeds=1,
+                    return_seeds=max(1, int(args.return_seeds)),
                 )
             except Exception as exc:
                 gui_set(gui_status, f"ik_error: {exc}")
                 print(f"[WARN] IK solve error: {exc}")
                 update_marker(target_marker, filtered_target, (255, 0, 0))
+                clear_score_gui()
                 time.sleep(sleep_dt)
                 continue
 
             if ik_success(result):
-                current_state = result.js_solution.clone()
-                latest_q = result.js_solution.clone()
-                visualizer.set_joint_state(result.js_solution.squeeze(0).squeeze(0))
-                update_marker(target_marker, filtered_target, (0, 220, 0))
-                gui_set(gui_status, "success")
+                candidates = extract_successful_ik_candidates(result)
+                q_prev = joint_state_position_1d(current_state).detach().clone()
+                q_best, score_info = select_best_ik_solution(
+                    candidates=candidates,
+                    q_prev=q_prev,
+                    q_nominal=q_nominal,
+                    q_min=q_min,
+                    q_max=q_max,
+                    latest_arm_config=latest_arm_config,
+                    ik=ik,
+                    target_link=target_link,
+                    args=args,
+                    elbow_swing_state=state,
+                )
+                if q_best is not None:
+                    joint_names = getattr(result.js_solution, "joint_names", None) or ik.joint_names
+                    current_state = joint_state_from_q(q_best, joint_names=joint_names)
+                    latest_q = current_state.clone()
+                    visualizer.set_joint_state(current_state.squeeze(0).squeeze(0))
+                    update_marker(target_marker, filtered_target, (0, 220, 0))
+                    update_score_gui(score_info)
+                    gui_set(gui_status, "success_selected")
+                else:
+                    update_marker(target_marker, filtered_target, (255, 0, 0))
+                    update_score_gui(score_info)
+                    gui_set(gui_status, "fail_no_candidate")
             else:
                 update_marker(target_marker, filtered_target, (255, 0, 0))
+                clear_score_gui()
                 gui_set(gui_status, "fail")
 
             time.sleep(sleep_dt)
