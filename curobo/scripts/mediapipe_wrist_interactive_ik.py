@@ -281,6 +281,73 @@ def packet_ee_quat(packet):
     return parse_quat_wxyz(packet.get("q_world_ee_target_wxyz"))
 
 
+def parse_packet_vec3(value):
+    if value is None:
+        return None
+    try:
+        vec = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if vec.shape != (3,) or not np.all(np.isfinite(vec)):
+        return None
+    return vec
+
+
+def parse_packet_float(value):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def packet_arm_config(packet: dict) -> dict:
+    points = packet.get("arm_points_world_m") if packet else None
+    vectors = packet.get("arm_vectors_world") if packet else None
+    if not isinstance(points, dict):
+        points = {}
+    if not isinstance(vectors, dict):
+        vectors = {}
+
+    valid = bool(packet.get("arm_config_valid", False)) if packet else False
+    plane_valid = bool(packet.get("arm_plane_valid", False)) if packet else False
+    confidence = parse_packet_float(packet.get("arm_config_confidence")) if packet else None
+    if confidence is None:
+        confidence = 0.0
+
+    return {
+        "valid": valid,
+        "plane_valid": plane_valid,
+        "confidence": confidence,
+        "points_world": {
+            "right_shoulder": parse_packet_vec3(points.get("right_shoulder")),
+            "right_elbow": parse_packet_vec3(points.get("right_elbow")),
+            "right_wrist": parse_packet_vec3(points.get("right_wrist")),
+        },
+        "vectors_world": {
+            "upper_arm": parse_packet_vec3(vectors.get("upper_arm")),
+            "forearm": parse_packet_vec3(vectors.get("forearm")),
+            "shoulder_to_wrist": parse_packet_vec3(vectors.get("shoulder_to_wrist")),
+        },
+        "elbow_internal_angle_rad": parse_packet_float(packet.get("elbow_internal_angle_rad")) if packet else None,
+        "elbow_internal_angle_deg": parse_packet_float(packet.get("elbow_internal_angle_deg")) if packet else None,
+        "elbow_flexion_angle_rad": parse_packet_float(packet.get("elbow_flexion_angle_rad")) if packet else None,
+        "elbow_flexion_angle_deg": parse_packet_float(packet.get("elbow_flexion_angle_deg")) if packet else None,
+        "arm_plane_normal_world": parse_packet_vec3(packet.get("arm_plane_normal_world")) if packet else None,
+        "arm_plane_normal_ref_world": parse_packet_vec3(packet.get("arm_plane_normal_ref_world")) if packet else None,
+        "elbow_swing_angle_rad": parse_packet_float(packet.get("elbow_swing_angle_rad")) if packet else None,
+        "elbow_swing_angle_deg": parse_packet_float(packet.get("elbow_swing_angle_deg")) if packet else None,
+        "elbow_swing_angle_signed_rad": parse_packet_float(packet.get("elbow_swing_angle_signed_rad")) if packet else None,
+        "elbow_swing_angle_signed_deg": parse_packet_float(packet.get("elbow_swing_angle_signed_deg")) if packet else None,
+        "frame": packet.get("arm_config_frame") if packet and isinstance(packet.get("arm_config_frame"), str) else None,
+        "semantics": packet.get("arm_config_semantics") if packet and isinstance(packet.get("arm_config_semantics"), str) else None,
+    }
+
+
 def make_pose(position: np.ndarray, quaternion_wxyz: np.ndarray) -> Pose:
     # cuRobo Pose expects quaternion in wxyz order.
     pos = torch.tensor(position, device="cuda", dtype=torch.float32).view(1, 3)
@@ -309,6 +376,14 @@ def update_marker(marker, position: np.ndarray, color):
 
 def gui_set(handle, value):
     handle.value = str(value)
+
+
+def gui_float(value, digits=2):
+    return "--" if value is None else f"{value:.{digits}f}"
+
+
+def gui_vec(value, digits=4):
+    return "--" if value is None else np.round(value, digits).tolist()
 
 
 def main():
@@ -386,6 +461,13 @@ def main():
         gui_target_position = server.gui.add_text("target_ee_pos_m", initial_value="--", disabled=True)
         gui_udp_ee_quat = server.gui.add_text("udp_ee_quat_wxyz", initial_value="--", disabled=True)
         gui_target_quat = server.gui.add_text("target_quat_wxyz", initial_value="--", disabled=True)
+        gui_arm_config_valid = server.gui.add_text("arm_config_valid", initial_value="false", disabled=True)
+        gui_arm_config_confidence = server.gui.add_text("arm_config_confidence", initial_value="--", disabled=True)
+        gui_elbow_flexion_deg = server.gui.add_text("elbow_flexion_deg", initial_value="--", disabled=True)
+        gui_elbow_swing_deg = server.gui.add_text("elbow_swing_deg", initial_value="--", disabled=True)
+        gui_elbow_swing_signed_deg = server.gui.add_text("elbow_swing_signed_deg", initial_value="--", disabled=True)
+        gui_arm_plane_valid = server.gui.add_text("arm_plane_valid", initial_value="false", disabled=True)
+        gui_arm_plane_normal_world = server.gui.add_text("arm_plane_normal_world", initial_value="--", disabled=True)
         reset_origin_btn = server.gui.add_button("Reset delta origin")
 
     state = {"reset_delta_origin": False}
@@ -408,6 +490,9 @@ def main():
     filtered_target = None
     previous_mouse_pose = None
     last_packet_key = None
+    # latest_arm_config will be used later for redundancy scoring:
+    # E_elbow / E_plane / elbow_swing preference should be computed after multiple IK solutions are returned.
+    latest_arm_config = packet_arm_config(None)
     sleep_dt = 1.0 / max(1.0, float(args.loop_hz))
 
     try:
@@ -441,6 +526,13 @@ def main():
                 gui_set(gui_udp_visibility, "n/a")
                 gui_set(gui_udp_position, "n/a")
                 gui_set(gui_udp_ee_quat, "n/a")
+                gui_set(gui_arm_config_valid, "n/a")
+                gui_set(gui_arm_config_confidence, "n/a")
+                gui_set(gui_elbow_flexion_deg, "n/a")
+                gui_set(gui_elbow_swing_deg, "n/a")
+                gui_set(gui_elbow_swing_signed_deg, "n/a")
+                gui_set(gui_arm_plane_valid, "n/a")
+                gui_set(gui_arm_plane_normal_world, "n/a")
 
             else:
                 udp_packet, recv_t = receiver.get_latest() if receiver is not None else (None, None)
@@ -448,6 +540,8 @@ def main():
                 packet_is_fresh = udp_age_s is not None and udp_age_s <= args.target_timeout_s
                 source_pos = packet_position(udp_packet, args.mapping_mode)
                 source_quat = packet_ee_quat(udp_packet) if args.use_udp_ee_orientation else None
+                arm_config = packet_arm_config(udp_packet)
+                latest_arm_config = arm_config
                 target_valid = bool(packet_is_fresh and source_pos is not None)
 
                 if target_valid:
@@ -509,6 +603,13 @@ def main():
                 source_display = packet_position(udp_packet, "delta") if udp_packet else None
                 gui_set(gui_udp_position, "--" if source_display is None else np.round(source_display, 4).tolist())
                 gui_set(gui_udp_ee_quat, "--" if source_quat is None else np.round(source_quat, 4).tolist())
+                gui_set(gui_arm_config_valid, bool(arm_config["valid"]))
+                gui_set(gui_arm_config_confidence, gui_float(arm_config["confidence"], 3))
+                gui_set(gui_elbow_flexion_deg, gui_float(arm_config["elbow_flexion_angle_deg"], 2))
+                gui_set(gui_elbow_swing_deg, gui_float(arm_config["elbow_swing_angle_deg"], 2))
+                gui_set(gui_elbow_swing_signed_deg, gui_float(arm_config["elbow_swing_angle_signed_deg"], 2))
+                gui_set(gui_arm_plane_valid, bool(arm_config["plane_valid"]))
+                gui_set(gui_arm_plane_normal_world, gui_vec(arm_config["arm_plane_normal_world"], 4))
 
             if not target_valid or target_position is None:
                 gui_set(gui_status, "lost")

@@ -1315,7 +1315,14 @@ def make_wrist_udp_packet(
     publish_delta: bool,
     palm_state: Optional[dict],
 ) -> dict:
+    right_shoulder_camera = rgbd_camera_points.get("RIGHT_SHOULDER")
+    right_elbow_camera = rgbd_camera_points.get("RIGHT_ELBOW")
     right_wrist_camera = rgbd_camera_points.get("RIGHT_WRIST")
+    arm_config_valid = (
+        right_shoulder_camera is not None
+        and right_elbow_camera is not None
+        and right_wrist_camera is not None
+    )
 
     position_valid = right_wrist_camera is not None
     delta_camera = None
@@ -1382,6 +1389,27 @@ def make_wrist_udp_packet(
         # 标记 target_position_m 的生成模式。
         # True 表示发布的是 camera delta；False 表示发布的是当前 camera 绝对位置。
         "publish_delta": bool(publish_delta),
+
+        # 右臂关键点在 Orbbec camera optical frame 下的绝对 3D 坐标，单位 meter。
+        # 这些点只作为上游感知数据透传给 bridge，不参与本脚本的 IK 或坐标系变换。
+        "arm_points_camera_m": {
+            "right_shoulder": arr_to_list(right_shoulder_camera),
+            "right_elbow": arr_to_list(right_elbow_camera),
+            "right_wrist": arr_to_list(right_wrist_camera),
+        },
+
+        # 每个右臂关键点的 RGB-D 反投影是否有效。
+        # 某个点无效只影响 arm_config_valid，不影响原有 RIGHT_WRIST target 发布逻辑。
+        "arm_points_valid": {
+            "right_shoulder": right_shoulder_camera is not None,
+            "right_elbow": right_elbow_camera is not None,
+            "right_wrist": right_wrist_camera is not None,
+        },
+
+        # 只有右肩、右肘、右腕三个 camera-frame 3D 点全部有效时才为 True。
+        "arm_config_valid": bool(arm_config_valid),
+        "arm_config_source_frame": str(frame_name),
+        "arm_config_semantics": "right_arm_shoulder_elbow_wrist_camera_points",
     }
     packet.update(palm_state_udp_fields(palm_state, str(frame_name)))
     return packet
@@ -1407,6 +1435,10 @@ def build_info_panel(
     intrinsics_available: bool,
     udp_enabled: bool,
     udp_port: int,
+    udp_frame: str,
+    publish_delta: bool,
+    right_shoulder_camera,
+    right_elbow_camera,
     right_wrist_camera,
     delta_camera,
     target_position,
@@ -1423,6 +1455,9 @@ def build_info_panel(
     panel[:] = (20, 20, 20)
     y = 28
 
+    def yn(value):
+        return "yes" if value else "no"
+
     def line(text, color=(230, 230, 230), scale=0.43, gap=20):
         nonlocal y
         put_text(panel, text, (12, y), scale=scale, color=color, bg=False)
@@ -1435,11 +1470,45 @@ def build_info_panel(
     line(f"RGB-D: {'yes' if intrinsics_available else 'no'} | UDP: {'on' if udp_enabled else 'off'} {udp_port if udp_enabled else '--'}", gap=18)
     line("Origin: camera optical frame", color=(180, 220, 220), scale=0.36, gap=20)
 
+    position_valid = right_wrist_camera is not None
+    target_valid = target_position is not None
+    origin_ready = delta_camera is not None
+    arm_config_valid = (
+        right_shoulder_camera is not None
+        and right_elbow_camera is not None
+        and right_wrist_camera is not None
+    )
+    palm_valid = bool(palm_state and palm_state.get("valid", False))
+    mode = "delta_camera" if publish_delta else "camera_position"
+    line(
+        f"UDP valid: target={yn(target_valid)} pos={yn(position_valid)} palm={yn(palm_valid)}",
+        color=(180, 230, 255),
+        scale=0.34,
+        gap=17,
+    )
+    line(
+        f"UDP mode: {mode} | origin={yn(origin_ready)}",
+        color=(180, 230, 255),
+        scale=0.34,
+        gap=17,
+    )
+    line(
+        "Arm RGB-D valid S/E/W/all: "
+        f"{yn(right_shoulder_camera is not None)}/"
+        f"{yn(right_elbow_camera is not None)}/"
+        f"{yn(right_wrist_camera is not None)}/"
+        f"{yn(arm_config_valid)}",
+        color=(180, 230, 255),
+        scale=0.32,
+        gap=17,
+    )
+    line(f"source_frame: {udp_frame}", color=(180, 180, 180), scale=0.31, gap=20)
+
     if show_skeleton_panel:
         canvas_w = max(120, panel_w - 24)
-        reserved_text_h = 180
+        reserved_text_h = 285
         available_h = panel_h - y - reserved_text_h
-        canvas_h = min(int(skeleton_panel_height), max(120, available_h))
+        canvas_h = min(int(skeleton_panel_height), max(80, available_h))
         if y + canvas_h + 8 < panel_h:
             skel_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
             draw_normalized_right_arm_hand_canvas(
@@ -1454,19 +1523,21 @@ def build_info_panel(
 
     put_text(panel, "Position", (12, y), scale=0.54, color=(0, 255, 0), bg=False)
     y += 25
-    line(f"R wrist camera     : {fmt_vec(right_wrist_camera)}", scale=0.38)
-    line(f"Delta camera       : {fmt_vec(delta_camera)}", scale=0.38)
-    line(f"target_position_m  : {fmt_vec(target_position)}", scale=0.38, gap=24)
+    line(f"R shoulder camera  : {fmt_vec(right_shoulder_camera)}", scale=0.36, gap=18)
+    line(f"R elbow camera     : {fmt_vec(right_elbow_camera)}", scale=0.36, gap=18)
+    line(f"R wrist camera     : {fmt_vec(right_wrist_camera)}", scale=0.36, gap=18)
+    line(f"Delta camera       : {fmt_vec(delta_camera)}", scale=0.36, gap=18)
+    line(f"target_position_m  : {fmt_vec(target_position)}", scale=0.36, gap=24)
 
     put_text(panel, "Palm", (12, y), scale=0.54, color=(255, 120, 255), bg=False)
     y += 25
-    palm_valid = bool(palm_state and palm_state.get("valid", False))
     line(f"Palm valid: {'yes' if palm_valid else 'no'} ({palm_state.get('reason', '--')})", color=(0, 255, 0) if palm_valid else (80, 80, 255), scale=0.38)
     line("Palm source: selected right hand only", color=(180, 180, 180), scale=0.34, gap=17)
     score = palm_state.get("handedness_score")
     line(f"Hand: {palm_state.get('handedness', 'none')} score={'--' if score is None else f'{score:.3f}'}", scale=0.38)
     angle = palm_state.get("angle_from_origin_deg")
     line(f"Angle from origin: {'--' if angle is None else f'{angle:.1f} deg'}", scale=0.38)
+    line(f"Palm origin cam: {fmt_vec(palm_state.get('palm_origin_camera_m'))}", scale=0.36)
     q_delta = palm_state.get("q_delta_palm_wxyz")
     if q_delta is None:
         line("q_delta wxyz: --", scale=0.36)
@@ -1478,10 +1549,28 @@ def build_info_panel(
     put_text(panel, "Keys", (12, y), scale=0.52, color=(0, 255, 255), bg=False)
     y += 24
     line("p pause/resume", scale=0.38)
+    line("w / s scroll panel", scale=0.38)
     line("r reset wrist origin", scale=0.38)
     line("o reset palm origin", scale=0.38)
     line("q / ESC quit", scale=0.38)
     return panel
+
+
+def crop_scroll_panel(panel_full: np.ndarray, visible_h: int, scroll_offset: int) -> Tuple[np.ndarray, int, int]:
+    max_scroll = max(0, int(panel_full.shape[0]) - int(visible_h))
+    scroll_offset = int(np.clip(scroll_offset, 0, max_scroll))
+    panel_view = panel_full[scroll_offset:scroll_offset + visible_h].copy()
+    if max_scroll > 0:
+        text = f"panel scroll {scroll_offset}/{max_scroll}  w/s"
+        put_text(
+            panel_view,
+            text,
+            (12, visible_h - 14),
+            scale=0.36,
+            color=(0, 255, 255),
+            bg=True,
+        )
+    return panel_view, scroll_offset, max_scroll
 
 
 # ============================================================
@@ -1567,12 +1656,14 @@ def main():
     wrist_origin_camera = None
     palm_runtime = {"R0": None, "R_prev": None, "R_filtered": None}
     latest_valid_palm_R = None
+    panel_scroll_offset = 0
+    panel_scroll_step = 60
 
     window_name = "Right Arm / Right Hand Orbbec Teleop Publisher"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
     print("[INFO] Started.")
-    print(f"[INFO] Keys: q/ESC quit, p pause/resume, {args.reset_origin_key} reset wrist origin, {args.palm_reset_key} reset palm origin")
+    print(f"[INFO] Keys: q/ESC quit, p pause/resume, w/s scroll panel, {args.reset_origin_key} reset wrist origin, {args.palm_reset_key} reset palm origin")
     print(f"[INFO] mirror={mirror}, hand={hand_enabled}, origin=camera")
 
     try:
@@ -1673,6 +1764,8 @@ def main():
                     frame_h=frame_bgr.shape[0],
                     visibility_threshold=args.visibility_threshold,
                 )
+                right_shoulder_camera = rgbd_camera_points.get("RIGHT_SHOULDER")
+                right_elbow_camera = rgbd_camera_points.get("RIGHT_ELBOW")
                 right_wrist_camera = rgbd_camera_points.get("RIGHT_WRIST")
 
                 hand_camera_points = compute_hand_camera_points(
@@ -1744,8 +1837,9 @@ def main():
 
                 h, _w = vis_frame.shape[:2]
                 panel_w = max(360, args.panel_width)
-                panel = build_info_panel(
-                    panel_h=h,
+                panel_full_h = max(h, h + 420, int(args.panel_skeleton_height) + 520)
+                panel_full = build_info_panel(
+                    panel_h=panel_full_h,
                     panel_w=panel_w,
                     fps=fps_smooth,
                     pose_detected=pose_detected,
@@ -1753,6 +1847,10 @@ def main():
                     intrinsics_available=intrinsics_available,
                     udp_enabled=udp_pub is not None,
                     udp_port=args.udp_port,
+                    udp_frame=args.udp_frame,
+                    publish_delta=args.publish_delta,
+                    right_shoulder_camera=right_shoulder_camera,
+                    right_elbow_camera=right_elbow_camera,
                     right_wrist_camera=right_wrist_camera,
                     delta_camera=delta_camera,
                     target_position=target_position,
@@ -1764,6 +1862,11 @@ def main():
                     visibility_threshold=args.visibility_threshold,
                     show_skeleton_panel=args.panel_skeleton,
                     skeleton_panel_height=args.panel_skeleton_height,
+                )
+                panel, panel_scroll_offset, panel_max_scroll = crop_scroll_panel(
+                    panel_full,
+                    visible_h=h,
+                    scroll_offset=panel_scroll_offset,
                 )
 
                 final_vis = np.hstack([vis_frame, panel])
@@ -1785,6 +1888,10 @@ def main():
                 if key == ord("p"):
                     paused = not paused
                     print("[INFO] paused =", paused)
+                if key == ord("w"):
+                    panel_scroll_offset = max(0, panel_scroll_offset - panel_scroll_step)
+                if key == ord("s"):
+                    panel_scroll_offset = min(panel_max_scroll, panel_scroll_offset + panel_scroll_step)
 
                 reset_key = (args.reset_origin_key or "r").lower()[:1]
                 if reset_key and key == ord(reset_key):

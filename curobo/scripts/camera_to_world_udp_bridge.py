@@ -324,6 +324,142 @@ def mat_to_list(value: Optional[np.ndarray]):
     return np.asarray(value, dtype=np.float32).astype(float).tolist()
 
 
+def normalize_vec(v: Optional[np.ndarray], eps: float = 1e-6) -> Optional[np.ndarray]:
+    if v is None:
+        return None
+    n = float(np.linalg.norm(v))
+    if n < eps or not np.isfinite(n):
+        return None
+    return (v / n).astype(np.float32)
+
+
+def visibility_confidence(packet: dict, valid: bool) -> float:
+    visibility = packet.get("arm_visibility")
+    if isinstance(visibility, dict):
+        vals = []
+        for name in ("right_shoulder", "right_elbow", "right_wrist"):
+            try:
+                value = visibility.get(name)
+                if value is not None and np.isfinite(float(value)):
+                    vals.append(float(value))
+            except (TypeError, ValueError):
+                pass
+        if len(vals) == 3:
+            return float(min(vals))
+    return 1.0 if valid else 0.0
+
+
+def transform_arm_points(packet: dict, R: np.ndarray, t: np.ndarray) -> dict:
+    arm_points_camera = packet.get("arm_points_camera_m")
+    if not isinstance(arm_points_camera, dict):
+        arm_points_camera = {}
+
+    right_shoulder_camera = parse_vec3(arm_points_camera.get("right_shoulder"))
+    right_elbow_camera = parse_vec3(arm_points_camera.get("right_elbow"))
+    right_wrist_camera = parse_vec3(arm_points_camera.get("right_wrist"))
+
+    right_shoulder_world = None if right_shoulder_camera is None else R @ right_shoulder_camera + t
+    right_elbow_world = None if right_elbow_camera is None else R @ right_elbow_camera + t
+    right_wrist_world = None if right_wrist_camera is None else R @ right_wrist_camera + t
+
+    return {
+        "right_shoulder": right_shoulder_world,
+        "right_elbow": right_elbow_world,
+        "right_wrist": right_wrist_world,
+    }
+
+
+def compute_right_arm_config_world(arm_points_world: dict, packet: dict, state: dict) -> dict:
+    eps = 1e-6
+    p_s = arm_points_world.get("right_shoulder")
+    p_e = arm_points_world.get("right_elbow")
+    p_w = arm_points_world.get("right_wrist")
+
+    upper_arm = None
+    forearm = None
+    shoulder_to_wrist = None
+    elbow_internal_angle = None
+    elbow_flexion_angle = None
+    arm_plane_normal = None
+    arm_plane_valid = False
+    elbow_swing_angle = None
+    elbow_swing_angle_signed = None
+
+    arm_config_valid = bool(p_s is not None and p_e is not None and p_w is not None)
+    if arm_config_valid:
+        upper_arm = p_e - p_s
+        forearm = p_w - p_e
+        shoulder_to_wrist = p_w - p_s
+
+        to_shoulder = p_s - p_e
+        to_wrist = p_w - p_e
+        len_to_shoulder = float(np.linalg.norm(to_shoulder))
+        len_to_wrist = float(np.linalg.norm(to_wrist))
+        len_upper = float(np.linalg.norm(upper_arm))
+        len_forearm = float(np.linalg.norm(forearm))
+        arm_config_valid = bool(len_upper > eps and len_forearm > eps)
+
+        if arm_config_valid and len_to_shoulder > eps and len_to_wrist > eps:
+            cos_internal = float(np.dot(to_shoulder, to_wrist) / (len_to_shoulder * len_to_wrist))
+            elbow_internal_angle = float(np.arccos(np.clip(cos_internal, -1.0, 1.0)))
+            elbow_flexion_angle = float(np.pi - elbow_internal_angle)
+
+            normal_raw = np.cross(upper_arm, forearm)
+            arm_plane_normal = normalize_vec(normal_raw, eps)
+            if arm_plane_normal is not None:
+                last_normal = state.get("last_valid_arm_plane_normal_world")
+                if last_normal is not None and float(np.dot(arm_plane_normal, last_normal)) < 0.0:
+                    arm_plane_normal = -arm_plane_normal
+                state["last_valid_arm_plane_normal_world"] = arm_plane_normal.copy()
+                arm_plane_valid = True
+
+                normal_ref = state.get("arm_plane_normal_ref_world")
+                if normal_ref is None:
+                    normal_ref = arm_plane_normal.copy()
+                    state["arm_plane_normal_ref_world"] = normal_ref
+
+                cross_ref_cur = np.cross(normal_ref, arm_plane_normal)
+                dot_ref_cur = float(np.clip(np.dot(normal_ref, arm_plane_normal), -1.0, 1.0))
+                elbow_swing_angle = float(np.arctan2(np.linalg.norm(cross_ref_cur), dot_ref_cur))
+
+                swing_axis = normalize_vec(shoulder_to_wrist, eps)
+                if swing_axis is not None:
+                    elbow_swing_angle_signed = float(
+                        np.arctan2(float(np.dot(swing_axis, cross_ref_cur)), dot_ref_cur)
+                    )
+
+    confidence = visibility_confidence(packet, arm_config_valid)
+    normal_ref = state.get("arm_plane_normal_ref_world")
+
+    return {
+        "arm_points_world_m": {
+            "right_shoulder": vec_to_list(p_s),
+            "right_elbow": vec_to_list(p_e),
+            "right_wrist": vec_to_list(p_w),
+        },
+        "arm_vectors_world": {
+            "upper_arm": vec_to_list(upper_arm),
+            "forearm": vec_to_list(forearm),
+            "shoulder_to_wrist": vec_to_list(shoulder_to_wrist),
+        },
+        "elbow_internal_angle_rad": elbow_internal_angle,
+        "elbow_internal_angle_deg": None if elbow_internal_angle is None else float(np.degrees(elbow_internal_angle)),
+        "elbow_flexion_angle_rad": elbow_flexion_angle,
+        "elbow_flexion_angle_deg": None if elbow_flexion_angle is None else float(np.degrees(elbow_flexion_angle)),
+        "arm_plane_valid": bool(arm_plane_valid),
+        "arm_plane_normal_world": vec_to_list(arm_plane_normal) if arm_plane_valid else None,
+        "arm_plane_normal_ref_world": vec_to_list(normal_ref),
+        "elbow_swing_angle_rad": elbow_swing_angle,
+        "elbow_swing_angle_deg": None if elbow_swing_angle is None else float(np.degrees(elbow_swing_angle)),
+        "elbow_swing_angle_signed_rad": elbow_swing_angle_signed,
+        "elbow_swing_angle_signed_deg": None if elbow_swing_angle_signed is None else float(np.degrees(elbow_swing_angle_signed)),
+        "arm_config_valid": bool(arm_config_valid),
+        "arm_config_frame": "world",
+        "arm_config_semantics": "right_arm_shoulder_elbow_wrist_geometry",
+        "arm_config_confidence": float(confidence),
+    }
+
+
 def transform_position_fields(packet: dict, R: np.ndarray, t: np.ndarray):
     position_camera = parse_vec3(packet.get("position_camera_m"))
     delta_camera = parse_vec3(packet.get("delta_camera_m"))
@@ -468,7 +604,7 @@ def transform_palm_orientation(
     }
 
 
-def make_world_packet(packet: dict, R: np.ndarray, t: np.ndarray, args) -> dict:
+def make_world_packet(packet: dict, R: np.ndarray, t: np.ndarray, args, arm_state: dict) -> dict:
     fields = transform_position_fields(packet, R, t)
     target_position_world, target_semantics = make_target_position(packet, fields, R, t, args)
 
@@ -482,6 +618,8 @@ def make_world_packet(packet: dict, R: np.ndarray, t: np.ndarray, args) -> dict:
         valid_position = bool(upstream_position_valid and target_position_world is not None)
 
     palm_fields = transform_palm_orientation(packet, R, t, args.R_palm_ee)
+    arm_points_world = transform_arm_points(packet, R, t)
+    arm_fields = compute_right_arm_config_world(arm_points_world, packet, arm_state)
 
     output = dict(packet)
     output.update(
@@ -509,6 +647,7 @@ def make_world_packet(packet: dict, R: np.ndarray, t: np.ndarray, args) -> dict:
         }
     )
     output.update(palm_fields)
+    output.update(arm_fields)
     return output
 
 
@@ -538,6 +677,10 @@ def main():
     latest_valid_position = False
     latest_valid_orientation = False
     latest_target_position_world = None
+    arm_state = {
+        "last_valid_arm_plane_normal_world": None,
+        "arm_plane_normal_ref_world": None,
+    }
     next_status_t = time.time() + 1.0
 
     print(f"[INFO] camera_to_world_udp_bridge v2 input  {args.input_host}:{args.input_port}")
@@ -583,7 +726,7 @@ def main():
 
             received_count += 1
             try:
-                output_packet = make_world_packet(packet, R, t, args)
+                output_packet = make_world_packet(packet, R, t, args, arm_state)
             except Exception as exc:
                 print(f"[WARN] Failed to adapt packet: {exc}")
                 continue
