@@ -551,6 +551,54 @@ def get_pose_position_from_state(kin_state, link_name: str) -> Optional[torch.Te
         return None
 
 
+def _joint_names_from_state(value) -> Optional[List[str]]:
+    names = getattr(value, "joint_names", None)
+    return list(names) if names is not None else None
+
+
+def _filter_q_to_fk_joint_names(ik, arm_fk, q: torch.Tensor, model_dof: int):
+    """Filter a full q vector, e.g. arm+fingers, down to the FK model's active joints."""
+    target_names = None
+    for names in (
+        _joint_names_from_state(getattr(arm_fk, "default_joint_state", None)),
+        _joint_names_from_state(getattr(ik, "default_joint_state", None)),
+        list(getattr(ik, "joint_names", []) or []),
+    ):
+        if names is not None and len(names) == model_dof:
+            target_names = names
+            break
+    if target_names is None:
+        return q, None
+
+    source_name_candidates = []
+    ik_joint_names = list(getattr(ik, "joint_names", []) or [])
+    if len(ik_joint_names) == q.numel():
+        source_name_candidates.append(ik_joint_names)
+
+    for state in (getattr(ik, "default_joint_state", None), getattr(arm_fk, "default_joint_state", None)):
+        names = _joint_names_from_state(state)
+        if names is not None and len(names) == q.numel():
+            source_name_candidates.append(names)
+
+    for getter in (
+        lambda: ik.get_full_js(getattr(ik, "default_joint_state")),
+        lambda: arm_fk.get_full_js(getattr(arm_fk, "default_joint_state")),
+    ):
+        try:
+            names = _joint_names_from_state(getter())
+            if names is not None and len(names) == q.numel():
+                source_name_candidates.append(names)
+        except Exception:
+            continue
+
+    for source_names in source_name_candidates:
+        if all(name in source_names for name in target_names):
+            indices = [source_names.index(name) for name in target_names]
+            return q[indices].reshape(-1), target_names
+
+    return q, None
+
+
 def compute_robot_arm_points_world(
     ik,
     q,
@@ -560,13 +608,22 @@ def compute_robot_arm_points_world(
     wrist_link,
 ) -> dict:
     wrist_link = wrist_link or target_link
+    if q is None:
+        return {"valid": False, "shoulder": None, "elbow": None, "wrist": None, "reason": "q is None"}
     q = q.reshape(-1)
     arm_fk = getattr(ik, "_arm_scoring_kinematics", None) or getattr(ik, "kinematics", None)
     if arm_fk is None:
         return {"valid": False, "shoulder": None, "elbow": None, "wrist": None, "reason": "no FK model"}
 
     q_fk = q
+    q_fk_names = None
     model_dof = getattr(arm_fk, "dof", None)
+    if model_dof is not None and q_fk.numel() != int(model_dof):
+        q_filtered, q_filtered_names = _filter_q_to_fk_joint_names(ik, arm_fk, q_fk, int(model_dof))
+        if q_filtered.numel() == int(model_dof):
+            q_fk = q_filtered
+            q_fk_names = q_filtered_names
+
     if model_dof is not None and q_fk.numel() != int(model_dof):
         try:
             active_js = JointState.from_position(
@@ -590,7 +647,7 @@ def compute_robot_arm_points_world(
         }
 
     try:
-        joint_state = JointState.from_position(q_fk.reshape(1, 1, -1), joint_names=None)
+        joint_state = JointState.from_position(q_fk.reshape(1, 1, -1), joint_names=q_fk_names)
         kin_state = arm_fk.compute_kinematics(joint_state)
     except Exception as exc:
         return {"valid": False, "shoulder": None, "elbow": None, "wrist": None, "reason": f"FK failed: {exc}"}
@@ -789,6 +846,7 @@ def score_candidate_q(
             "robot_arm_reason": "candidate q invalid",
         }
 
+    q_prev_for_fk = joint_state_position_1d(q_prev).detach().clone() if q_prev is not None else None
     q_prev = _tensor_like_1d(q_prev, q)
     q_nominal = _tensor_like_1d(q_nominal, q)
 
@@ -865,7 +923,7 @@ def score_candidate_q(
             if robot_normal is not None and elbow_swing_state.get("robot_plane_ref") is None:
                 prev_points = compute_robot_arm_points_world(
                     ik=ik,
-                    q=q_prev,
+                    q=q_prev_for_fk,
                     target_link=target_link,
                     shoulder_link=args.robot_shoulder_link,
                     elbow_link=args.robot_elbow_link,
@@ -926,7 +984,7 @@ def score_candidate_q(
             ):
                 prev_points = compute_robot_arm_points_world(
                     ik=ik,
-                    q=q_prev,
+                    q=q_prev_for_fk,
                     target_link=target_link,
                     shoulder_link=args.robot_shoulder_link,
                     elbow_link=args.robot_elbow_link,

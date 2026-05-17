@@ -113,6 +113,18 @@ def parse_args():
     )
     parser.add_argument("--bridge-scale", type=float, default=1.0)
     parser.add_argument(
+        "--elbow-swing-delta-lower-deg",
+        type=float,
+        default=0.0,
+        help="lower band-pass threshold for signed elbow swing angle changes; smaller changes are treated as jitter",
+    )
+    parser.add_argument(
+        "--elbow-swing-delta-upper-deg",
+        type=float,
+        default=180.0,
+        help="upper band-pass threshold for signed elbow swing angle changes; larger changes are treated as spikes",
+    )
+    parser.add_argument(
         "--validate-rotation",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -333,6 +345,10 @@ def normalize_vec(v: Optional[np.ndarray], eps: float = 1e-6) -> Optional[np.nda
     return (v / n).astype(np.float32)
 
 
+def wrap_to_pi(angle: float) -> float:
+    return float(np.arctan2(np.sin(angle), np.cos(angle)))
+
+
 def visibility_confidence(packet: dict, valid: bool) -> float:
     visibility = packet.get("arm_visibility")
     if isinstance(visibility, dict):
@@ -347,6 +363,58 @@ def visibility_confidence(packet: dict, valid: bool) -> float:
         if len(vals) == 3:
             return float(min(vals))
     return 1.0 if valid else 0.0
+
+
+def filter_elbow_swing_angle(raw_signed: Optional[float], state: dict, args) -> Tuple[Optional[float], dict]:
+    """Band-pass filter signed elbow swing angle changes.
+
+    The filter is intentionally simple and stateful:
+    - first valid angle initializes the output;
+    - changes below the lower threshold are considered jitter and held;
+    - changes above the upper threshold are considered spikes and held;
+    - changes inside the band update the filtered output.
+    """
+    lower = max(0.0, float(np.deg2rad(args.elbow_swing_delta_lower_deg)))
+    upper = max(lower, float(np.deg2rad(args.elbow_swing_delta_upper_deg)))
+    info = {
+        "enabled": True,
+        "delta_lower_rad": lower,
+        "delta_upper_rad": upper,
+        "delta_lower_deg": float(np.rad2deg(lower)),
+        "delta_upper_deg": float(np.rad2deg(upper)),
+        "delta_rad": None,
+        "delta_deg": None,
+        "accepted": False,
+        "status": "no_raw_angle",
+    }
+
+    if raw_signed is None or not np.isfinite(float(raw_signed)):
+        return None, info
+
+    raw_signed = wrap_to_pi(float(raw_signed))
+    previous = state.get("elbow_swing_angle_signed_filtered_rad")
+    if previous is None:
+        state["elbow_swing_angle_signed_filtered_rad"] = raw_signed
+        info.update({"accepted": True, "status": "initialized", "delta_rad": 0.0, "delta_deg": 0.0})
+        return raw_signed, info
+
+    delta = wrap_to_pi(raw_signed - float(previous))
+    abs_delta = abs(delta)
+    info["delta_rad"] = float(delta)
+    info["delta_deg"] = float(np.rad2deg(delta))
+
+    if abs_delta < lower:
+        info["status"] = "held_below_lower"
+        return float(previous), info
+
+    if abs_delta > upper:
+        info["status"] = "held_above_upper"
+        return float(previous), info
+
+    filtered = wrap_to_pi(float(previous) + delta)
+    state["elbow_swing_angle_signed_filtered_rad"] = filtered
+    info.update({"accepted": True, "status": "accepted"})
+    return filtered, info
 
 
 def transform_arm_points(packet: dict, R: np.ndarray, t: np.ndarray) -> dict:
@@ -369,7 +437,7 @@ def transform_arm_points(packet: dict, R: np.ndarray, t: np.ndarray) -> dict:
     }
 
 
-def compute_right_arm_config_world(arm_points_world: dict, packet: dict, state: dict) -> dict:
+def compute_right_arm_config_world(arm_points_world: dict, packet: dict, state: dict, args) -> dict:
     eps = 1e-6
     p_s = arm_points_world.get("right_shoulder")
     p_e = arm_points_world.get("right_elbow")
@@ -384,6 +452,21 @@ def compute_right_arm_config_world(arm_points_world: dict, packet: dict, state: 
     arm_plane_valid = False
     elbow_swing_angle = None
     elbow_swing_angle_signed = None
+    elbow_swing_angle_raw = None
+    elbow_swing_angle_signed_raw = None
+    swing_delta_lower = max(0.0, float(np.deg2rad(args.elbow_swing_delta_lower_deg)))
+    swing_delta_upper = max(swing_delta_lower, float(np.deg2rad(args.elbow_swing_delta_upper_deg)))
+    elbow_swing_filter_info = {
+        "enabled": True,
+        "delta_lower_rad": swing_delta_lower,
+        "delta_upper_rad": swing_delta_upper,
+        "delta_lower_deg": float(np.rad2deg(swing_delta_lower)),
+        "delta_upper_deg": float(np.rad2deg(swing_delta_upper)),
+        "delta_rad": None,
+        "delta_deg": None,
+        "accepted": False,
+        "status": "not_computed",
+    }
 
     arm_config_valid = bool(p_s is not None and p_e is not None and p_w is not None)
     if arm_config_valid:
@@ -424,9 +507,16 @@ def compute_right_arm_config_world(arm_points_world: dict, packet: dict, state: 
 
                 swing_axis = normalize_vec(shoulder_to_wrist, eps)
                 if swing_axis is not None:
-                    elbow_swing_angle_signed = float(
+                    elbow_swing_angle_signed_raw = float(
                         np.arctan2(float(np.dot(swing_axis, cross_ref_cur)), dot_ref_cur)
                     )
+                    elbow_swing_angle_raw = float(abs(elbow_swing_angle_signed_raw))
+                    elbow_swing_angle_signed, elbow_swing_filter_info = filter_elbow_swing_angle(
+                        elbow_swing_angle_signed_raw, state, args
+                    )
+                    elbow_swing_angle = None if elbow_swing_angle_signed is None else float(abs(elbow_swing_angle_signed))
+                else:
+                    elbow_swing_angle_raw = elbow_swing_angle
 
     confidence = visibility_confidence(packet, arm_config_valid)
     normal_ref = state.get("arm_plane_normal_ref_world")
@@ -453,6 +543,13 @@ def compute_right_arm_config_world(arm_points_world: dict, packet: dict, state: 
         "elbow_swing_angle_deg": None if elbow_swing_angle is None else float(np.degrees(elbow_swing_angle)),
         "elbow_swing_angle_signed_rad": elbow_swing_angle_signed,
         "elbow_swing_angle_signed_deg": None if elbow_swing_angle_signed is None else float(np.degrees(elbow_swing_angle_signed)),
+        "elbow_swing_angle_raw_rad": elbow_swing_angle_raw,
+        "elbow_swing_angle_raw_deg": None if elbow_swing_angle_raw is None else float(np.degrees(elbow_swing_angle_raw)),
+        "elbow_swing_angle_signed_raw_rad": elbow_swing_angle_signed_raw,
+        "elbow_swing_angle_signed_raw_deg": (
+            None if elbow_swing_angle_signed_raw is None else float(np.degrees(elbow_swing_angle_signed_raw))
+        ),
+        "elbow_swing_filter": elbow_swing_filter_info,
         "arm_config_valid": bool(arm_config_valid),
         "arm_config_frame": "world",
         "arm_config_semantics": "right_arm_shoulder_elbow_wrist_geometry",
@@ -619,7 +716,7 @@ def make_world_packet(packet: dict, R: np.ndarray, t: np.ndarray, args, arm_stat
 
     palm_fields = transform_palm_orientation(packet, R, t, args.R_palm_ee)
     arm_points_world = transform_arm_points(packet, R, t)
-    arm_fields = compute_right_arm_config_world(arm_points_world, packet, arm_state)
+    arm_fields = compute_right_arm_config_world(arm_points_world, packet, arm_state, args)
 
     output = dict(packet)
     output.update(
@@ -680,6 +777,7 @@ def main():
     arm_state = {
         "last_valid_arm_plane_normal_world": None,
         "arm_plane_normal_ref_world": None,
+        "elbow_swing_angle_signed_filtered_rad": None,
     }
     next_status_t = time.time() + 1.0
 
@@ -694,6 +792,11 @@ def main():
     print(f"[INFO] t_world_camera = {t.tolist()}")
     print("[INFO] R_palm_ee =")
     print(R_palm_ee)
+    print(
+        "[INFO] elbow swing delta band-pass: "
+        f"lower={args.elbow_swing_delta_lower_deg} deg, "
+        f"upper={args.elbow_swing_delta_upper_deg} deg"
+    )
     print("[INFO] Press Ctrl+C to exit.")
 
     try:
