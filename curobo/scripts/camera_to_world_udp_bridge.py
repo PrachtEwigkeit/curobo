@@ -125,6 +125,18 @@ def parse_args():
         help="upper band-pass threshold for signed elbow swing angle changes; larger changes are treated as spikes",
     )
     parser.add_argument(
+        "--elbow-swing-test",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="open a 0-180 degree slider and publish its value as the human elbow swing angle",
+    )
+    parser.add_argument(
+        "--elbow-swing-test-initial-deg",
+        type=float,
+        default=0.0,
+        help="initial slider value for --elbow-swing-test",
+    )
+    parser.add_argument(
         "--validate-rotation",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -177,6 +189,64 @@ def load_palm_to_ee_rotation() -> np.ndarray:
     if not ok:
         raise SystemExit(f"[ERROR] Invalid R_palm_ee: {msg}")
     return R_palm_ee.astype(np.float32)
+
+
+class ElbowSwingTestSlider:
+    """Small stdlib Tk slider used only for manual elbow-swing protocol tests."""
+
+    def __init__(self, initial_deg: float):
+        import tkinter as tk
+
+        self._tk = tk
+        self._closed = False
+        self._last_value = float(np.clip(initial_deg, 0.0, 180.0))
+
+        self._root = tk.Tk()
+        self._root.title("Elbow swing test")
+        self._value = tk.DoubleVar(value=self._last_value)
+        tk.Label(
+            self._root,
+            text="Human elbow swing test angle (deg)",
+            padx=12,
+            pady=8,
+        ).pack()
+        self._scale = tk.Scale(
+            self._root,
+            from_=0.0,
+            to=180.0,
+            orient=tk.HORIZONTAL,
+            resolution=0.1,
+            length=420,
+            variable=self._value,
+        )
+        self._scale.pack(padx=12, pady=8)
+        self._label = tk.Label(self._root, text=f"{self._last_value:.1f} deg", padx=12, pady=8)
+        self._label.pack()
+        self._root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def update(self):
+        if self._closed:
+            return
+        try:
+            value = float(self._value.get())
+            self._last_value = float(np.clip(value, 0.0, 180.0))
+            self._label.configure(text=f"{self._last_value:.1f} deg")
+            self._root.update_idletasks()
+            self._root.update()
+        except Exception:
+            self._closed = True
+
+    def get_deg(self) -> float:
+        return self._last_value
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._root.destroy()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -511,12 +581,56 @@ def compute_right_arm_config_world(arm_points_world: dict, packet: dict, state: 
                         np.arctan2(float(np.dot(swing_axis, cross_ref_cur)), dot_ref_cur)
                     )
                     elbow_swing_angle_raw = float(abs(elbow_swing_angle_signed_raw))
-                    elbow_swing_angle_signed, elbow_swing_filter_info = filter_elbow_swing_angle(
-                        elbow_swing_angle_signed_raw, state, args
-                    )
-                    elbow_swing_angle = None if elbow_swing_angle_signed is None else float(abs(elbow_swing_angle_signed))
+                    if bool(getattr(args, "elbow_swing_test", False)):
+                        test_deg = float(np.clip(getattr(args, "elbow_swing_test_current_deg", 0.0), 0.0, 180.0))
+                        test_rad = float(np.deg2rad(test_deg))
+                        elbow_swing_angle_raw = test_rad
+                        elbow_swing_angle_signed_raw = test_rad
+                        elbow_swing_angle = test_rad
+                        elbow_swing_angle_signed = test_rad
+                        state["elbow_swing_angle_signed_filtered_rad"] = test_rad
+                        elbow_swing_filter_info = {
+                            "enabled": False,
+                            "delta_lower_rad": swing_delta_lower,
+                            "delta_upper_rad": swing_delta_upper,
+                            "delta_lower_deg": float(np.rad2deg(swing_delta_lower)),
+                            "delta_upper_deg": float(np.rad2deg(swing_delta_upper)),
+                            "delta_rad": None,
+                            "delta_deg": None,
+                            "accepted": True,
+                            "status": "test_slider_override",
+                        }
+                    else:
+                        elbow_swing_angle_signed, elbow_swing_filter_info = filter_elbow_swing_angle(
+                            elbow_swing_angle_signed_raw, state, args
+                        )
+                        elbow_swing_angle = (
+                            None if elbow_swing_angle_signed is None else float(abs(elbow_swing_angle_signed))
+                        )
                 else:
                     elbow_swing_angle_raw = elbow_swing_angle
+
+        if bool(getattr(args, "elbow_swing_test", False)) and arm_config_valid:
+            test_deg = float(np.clip(getattr(args, "elbow_swing_test_current_deg", 0.0), 0.0, 180.0))
+            test_rad = float(np.deg2rad(test_deg))
+            elbow_swing_angle_raw = test_rad
+            elbow_swing_angle_signed_raw = test_rad
+            elbow_swing_angle = test_rad
+            elbow_swing_angle_signed = test_rad
+            state["elbow_swing_angle_signed_filtered_rad"] = test_rad
+            if not arm_plane_valid:
+                arm_plane_valid = True
+            elbow_swing_filter_info = {
+                "enabled": False,
+                "delta_lower_rad": swing_delta_lower,
+                "delta_upper_rad": swing_delta_upper,
+                "delta_lower_deg": float(np.rad2deg(swing_delta_lower)),
+                "delta_upper_deg": float(np.rad2deg(swing_delta_upper)),
+                "delta_rad": None,
+                "delta_deg": None,
+                "accepted": True,
+                "status": "test_slider_override",
+            }
 
     confidence = visibility_confidence(packet, arm_config_valid)
     normal_ref = state.get("arm_plane_normal_ref_world")
@@ -751,6 +865,7 @@ def make_world_packet(packet: dict, R: np.ndarray, t: np.ndarray, args, arm_stat
 def main():
     args = parse_args()
     normalize_legacy_args(args)
+    args.elbow_swing_test_current_deg = float(np.clip(args.elbow_swing_test_initial_deg, 0.0, 180.0))
 
     R = load_rotation(args)
     t = parse_float_list(args.translation, 3, "--translation")
@@ -768,6 +883,15 @@ def main():
 
     send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     output_addr = (args.output_host, args.output_port)
+
+    elbow_swing_slider = None
+    if args.elbow_swing_test:
+        try:
+            elbow_swing_slider = ElbowSwingTestSlider(args.elbow_swing_test_current_deg)
+            print("[INFO] Elbow swing test slider enabled; publishing slider value instead of computed swing.")
+        except Exception as exc:
+            args.elbow_swing_test = False
+            print(f"[WARN] Could not open elbow swing test slider; disabling test mode: {exc}")
 
     received_count = 0
     published_count = 0
@@ -792,6 +916,8 @@ def main():
     print(f"[INFO] t_world_camera = {t.tolist()}")
     print("[INFO] R_palm_ee =")
     print(R_palm_ee)
+    if args.elbow_swing_test:
+        print(f"[INFO] elbow swing test initial value = {args.elbow_swing_test_current_deg:.1f} deg")
     print(
         "[INFO] elbow swing delta band-pass: "
         f"lower={args.elbow_swing_delta_lower_deg} deg, "
@@ -801,14 +927,24 @@ def main():
 
     try:
         while True:
+            if elbow_swing_slider is not None:
+                elbow_swing_slider.update()
+                args.elbow_swing_test_current_deg = elbow_swing_slider.get_deg()
+
             now_t = time.time()
             if now_t >= next_status_t:
+                swing_test_status = (
+                    f" elbow_swing_test_deg={args.elbow_swing_test_current_deg:.1f}"
+                    if args.elbow_swing_test
+                    else ""
+                )
                 print(
                     "[STATUS] "
                     f"received={received_count} published={published_count} "
                     f"latest_valid_position={latest_valid_position} "
                     f"latest_target_position_world_m={latest_target_position_world} "
                     f"latest_valid_orientation={latest_valid_orientation}"
+                    f"{swing_test_status}"
                 )
                 next_status_t = now_t + 1.0
 
@@ -851,6 +987,8 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] Bridge stopped.")
     finally:
+        if elbow_swing_slider is not None:
+            elbow_swing_slider.close()
         recv_sock.close()
         send_sock.close()
 
